@@ -179,6 +179,10 @@ impl<T: RobotIo> Safety<T> {
         self.io.read()
     }
 
+    pub fn set_drive_mode(&mut self, roller: bool, support: bool) -> Result<(), IoError> {
+        self.io.set_drive_mode(roller, support)
+    }
+
     /// Bus reads that are not part of the tick, passed through rather than exposing the IO.
     ///
     /// Safety owns the only `RobotIo` handle — that is what makes "nothing commands a motor

@@ -1518,6 +1518,11 @@ pub struct PolicyParams {
     /// `walk` (default) or `roller`. Changes which policies load *and* the tuning defaults
     /// below — every unset field resolves per mode, so a roller robot needs one line.
     pub mode: Mode,
+    /// Root of the installed policy set. Unset uses the board's standard policy directory.
+    /// A simulator names its local set here rather than overriding the walking slot, so a
+    /// live mode switch can still select the roller gait and crouch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub directory: Option<PathBuf>,
     /// Policy paths. Absent means the mode's default inside the release directory, so a
     /// normal update ships them; point one elsewhere to try a build without cutting a
     /// release. The literal `"none"` disables a slot outright — the prototype's convention.
@@ -1949,7 +1954,11 @@ pub const DEFAULT_SITSTAND_RAMP_S: f64 = 2.0;
 
 /// Read the installed set's manifest, if it has one.
 pub fn set_manifest() -> Option<SetManifest> {
-    let text = std::fs::read_to_string(PathBuf::from(POLICY_DIR).join("manifest.json")).ok()?;
+    set_manifest_in(std::path::Path::new(POLICY_DIR))
+}
+
+fn set_manifest_in(directory: &std::path::Path) -> Option<SetManifest> {
+    let text = std::fs::read_to_string(directory.join("manifest.json")).ok()?;
     serde_json::from_str(&text).ok()
 }
 
@@ -2197,13 +2206,24 @@ impl PolicyParams {
     /// declare adds it with the built-in's timing; `"none"` switches it off, as it does for a
     /// `[[policy.skill]]` entry.
     pub fn resolved_skills(&self) -> Vec<SkillDef> {
-        self.resolved_skills_with(set_manifest().as_ref())
+        self.resolved_skills_with(self.manifest().as_ref())
     }
 
     /// [`Self::resolved_skills`] against a manifest already read — or none, which is the
     /// fallback three.
     pub fn resolved_skills_with(&self, manifest: Option<&SetManifest>) -> Vec<SkillDef> {
         let mut resolved = builtin_skills(manifest);
+        if let Some(directory) = &self.directory {
+            for skill in &mut resolved {
+                if let Some(path) = skill
+                    .path
+                    .as_ref()
+                    .and_then(|p| p.strip_prefix(POLICY_DIR).ok())
+                {
+                    skill.path = Some(directory.join(path));
+                }
+            }
+        }
         for configured in &self.skills {
             match resolved.iter_mut().find(|s| s.name == configured.name) {
                 Some(builtin) => *builtin = configured.clone(),
@@ -2221,6 +2241,13 @@ impl PolicyParams {
                         skill.path = Some(path.clone());
                         resolved.push(skill);
                     }
+                }
+            }
+        }
+        if let Some(directory) = &self.directory {
+            for skill in &mut resolved {
+                if skill.path.is_none() {
+                    skill.path = Some(directory.join(format!("{}.onnx", skill.name)));
                 }
             }
         }
@@ -2260,7 +2287,13 @@ impl PolicyParams {
     }
 
     pub fn resolved(&self) -> ResolvedPolicy {
-        self.resolved_with(set_manifest().as_ref())
+        self.resolved_with(self.manifest().as_ref())
+    }
+
+    fn manifest(&self) -> Option<SetManifest> {
+        self.directory
+            .as_deref()
+            .map_or_else(set_manifest, set_manifest_in)
     }
 
     /// [`Self::resolved`] against a manifest already read — or none, which is what a board whose
@@ -2272,7 +2305,12 @@ impl PolicyParams {
     /// literals stay as the fallback, and a `[policy]` key still overrides either, because the
     /// file is the list of a person's decisions.
     pub fn resolved_with(&self, manifest: Option<&SetManifest>) -> ResolvedPolicy {
-        let release = |name: &str| PathBuf::from(POLICY_DIR).join(name);
+        let release = |name: &str| {
+            self.directory
+                .as_deref()
+                .unwrap_or_else(|| std::path::Path::new(POLICY_DIR))
+                .join(name)
+        };
         let path = |field: &Option<PathBuf>, default: Option<&str>| -> Option<PathBuf> {
             match field {
                 Some(p) if is_none_sentinel(p) => None,
@@ -2335,8 +2373,7 @@ impl PolicyParams {
             // health rule exists to prevent. `robot.loadPolicy` refuses to write it and
             // `drop_unloadable_overrides` clears it at startup and reports degraded; this is the
             // floor under both.
-            walk: path(&self.walk, Some(walk_default))
-                .unwrap_or_else(|| PathBuf::from(POLICY_DIR).join(walk_default)),
+            walk: path(&self.walk, Some(walk_default)).unwrap_or_else(|| release(walk_default)),
             stand: path(&self.stand, stand),
             sitstand: path(&self.sitstand, sitstand),
             ground_pick: path(&self.ground_pick, ground_pick),
@@ -2446,6 +2483,7 @@ impl Default for PolicyParams {
         Self {
             enabled: true,
             mode: Mode::Walk,
+            directory: None,
             walk: None,
             stand: None,
             sitstand: None,
@@ -2468,6 +2506,79 @@ impl Default for PolicyParams {
             nominal_voltage: 7.4,
             allow_community: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod local_policy_set_tests {
+    use super::*;
+
+    #[test]
+    fn a_local_set_selects_both_gaits_without_overriding_the_slots() {
+        let directory = PathBuf::from("/tmp/local-duck-policies");
+        let mut policy = PolicyParams {
+            directory: Some(directory.clone()),
+            ..Default::default()
+        };
+        let walking = policy.resolved_with(None);
+        assert_eq!(walking.walk, directory.join("velstand.onnx"));
+        assert_eq!(
+            walking.ground_pick,
+            Some(directory.join("alpha_ground_pick.onnx"))
+        );
+        policy.mode = Mode::Roller;
+        let skating = policy.resolved_with(None);
+        assert_eq!(skating.walk, directory.join("roller.onnx"));
+        assert_eq!(
+            skating.ground_pick,
+            Some(directory.join("roller_crouch.onnx"))
+        );
+        assert_eq!(
+            skating.sitstand,
+            Some(directory.join("alpha_sitstand.onnx"))
+        );
+        assert!(
+            skating
+                .skills
+                .iter()
+                .all(|s| s.resolved_path().unwrap().starts_with(&directory))
+        );
+        policy.walk = Some("/tmp/custom-gait.onnx".into());
+        assert_eq!(
+            policy.resolved_with(None).walk,
+            PathBuf::from("/tmp/custom-gait.onnx")
+        );
+    }
+
+    #[test]
+    fn local_set_reads_its_own_manifest_and_keeps_explicit_skill_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("manifest.json"),
+            r#"{"policies":[{"file":"hello.onnx","name":"wave","kind":"episodic",
+                "duration_s":2.5,"command":{"encoding":"constant","active":[0,0,0]}}]}"#,
+        )
+        .unwrap();
+        let mut policy = PolicyParams {
+            directory: Some(directory.path().to_owned()),
+            ..Default::default()
+        };
+        let skills = policy.resolved_skills();
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "wave");
+        assert_eq!(
+            skills[0].resolved_path(),
+            Some(directory.path().join("hello.onnx"))
+        );
+        policy.skills = vec![SkillDef {
+            name: "wave".into(),
+            path: Some("/tmp/custom-wave.onnx".into()),
+            ..Default::default()
+        }];
+        assert_eq!(
+            policy.resolved_skills()[0].resolved_path(),
+            Some(PathBuf::from("/tmp/custom-wave.onnx"))
+        );
     }
 }
 

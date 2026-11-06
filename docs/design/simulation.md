@@ -81,6 +81,7 @@ fn write(&mut self, targets: &JointTargets) -> Result<()>;
 fn set_gain(&mut self, kp: u16) -> Result<()>;
 fn set_torque(&mut self, on: bool) -> Result<()>;
 fn slow_sensors(&mut self) -> Result<SlowSensors>;   // volts, per-joint temperature
+fn set_drive_mode(&mut self, roller: bool, support: bool) -> Result<()>; // simulation only
 ```
 
 Above it, nothing changes: the 50 Hz loop, the ONNX policies, `Safety`, fall detection, odometry,
@@ -110,9 +111,32 @@ implementation and carries the reasoning; the short version:
 * **`TCP_NODELAY`**, not as a micro-optimisation: Nagle delays a small write up to ~40 ms, twice the
   tick, and it would present as a slow simulator.
 
-Requests are `{"op":"hello"|"read"|"write"|"gain"|"torque"|"slow", …}`. The handshake carries
-`protocol` (currently 1) and is checked in both directions, because the two halves live in two
+Requests are `{"op":"hello"|"read"|"write"|"gain"|"torque"|"slow"|"mode", …}`. The handshake carries
+`protocol` (currently 2) and is checked in both directions, because the two halves live in two
 repositories and "your simulator is old" and "your daemon is old" are otherwise the same symptom.
+
+**Drive mode includes equipment.** Before reading sensors, `robotd` synchronises its current
+policy mode through `RobotIo::set_drive_mode`. `RemoteIo` sends
+`{"op":"mode","mode":"walk"|"roller","support":true|false}` once per equipment/support
+change and again after reconnecting.
+The body server replaces the corresponding robot's MJCF with feet or passive-wheeled skates;
+the world, joint state, actuator targets, momentum and floor clearance survive the swap.
+Rendering and head cameras rebind to the new model without restarting the servers. Equipment
+switching requires a robot include and a plane named `floor`; unsupported scenes refuse explicitly.
+Update **both** runtime and `microduck_rl` for protocol 2; protocol 1 peers cannot be mixed in.
+
+**Assisted transition, unassisted locomotion.** During a standing mode switch's home ramp,
+`support` holds the simulated trunk upright at the current planar position and heading,
+at a height calculated for the home pose's floor clearance. The leg motors still perform
+the ramp. After loading the new gait and fitting the equipment, support expires after
+0.3 simulated seconds so the gait takes over. Torque off clears it immediately; a controlling
+connection closing also releases it. `read` exposes simulation-only `supported` for verification.
+An already seated robot keeps its seat. This is a simulation convenience, not an autonomous
+equipment-change or balance policy; real hardware receives no artificial support.
+
+`duck-sim` names its installed set with `[policy] directory`, so switching to roller selects
+`roller.onnx` and its crouch rather than retaining a walking-slot override. The standard
+board directory and explicitly overridden slots keep their existing semantics.
 
 **The simulator reports in the robot's own units** — radians, rad/s, mA, and the IMU already
 resolved into the trunk frame. MuJoCo knows its own model's ordering, scaling and frames; a

@@ -20,6 +20,7 @@ use std::sync::{Arc, Mutex};
 /// 255 rather than 0, because 0 is a real mode code and a sentinel that collides with a value is
 /// how a "switch to walking" request becomes a no-op.
 pub const MODE_NONE: u8 = u8::MAX;
+const MODE_CANCELLED: u8 = MODE_NONE - 1;
 
 /// Encodings for [`Intents::power`]. An `AtomicU8` rather than two bools, so "init" and "relax"
 /// cannot both be pending — they are alternatives, and the last one asked for wins.
@@ -320,6 +321,7 @@ impl Intents {
     /// Zero the velocity now. Distinct from the deadman only in that it is deliberate.
     pub fn stop(&self) {
         self.set_twist([0.0; 3]);
+        self.mode_switch.store(MODE_CANCELLED, Ordering::Relaxed);
     }
 
     pub fn set_pose(&self, pose: PoseIntent) {
@@ -421,12 +423,26 @@ impl Intents {
         self.mode_switch.store(code, Ordering::Relaxed);
     }
 
+    pub fn take_mode_cancellation(&self) -> bool {
+        self.mode_switch
+            .compare_exchange(
+                MODE_CANCELLED,
+                MODE_NONE,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+    }
+
     /// Take a pending mode switch. Taken, so the sequence runs once per request.
     pub fn take_mode_switch(&self) -> Option<u8> {
-        match self.mode_switch.swap(MODE_NONE, Ordering::Relaxed) {
-            MODE_NONE => None,
-            code => Some(code),
+        let code = self.mode_switch.load(Ordering::Relaxed);
+        if code == MODE_NONE || code == MODE_CANCELLED {
+            return None;
         }
+        self.mode_switch
+            .compare_exchange(code, MODE_NONE, Ordering::Relaxed, Ordering::Relaxed)
+            .ok()
     }
 
     /// Ask for a policy change: one slot to a file, one slot back to its default, or all of
@@ -708,6 +724,25 @@ mod tests {
         let snap = intents.snapshot();
         assert_eq!(snap.command.twist, [0.0; 3]);
         assert!(snap.enabled, "stop is not disable");
+    }
+
+    #[test]
+    fn stop_cancels_pending_and_in_flight_modes_without_becoming_a_mode() {
+        let intents = Intents::new();
+        intents.request_mode_switch(1);
+        intents.stop();
+        assert_eq!(intents.take_mode_switch(), None);
+        assert!(intents.take_mode_cancellation());
+        assert!(!intents.take_mode_cancellation());
+        intents.request_mode_switch(1);
+        assert_eq!(intents.take_mode_switch(), Some(1));
+        intents.stop();
+        assert!(intents.take_mode_cancellation());
+        assert_eq!(intents.take_mode_switch(), None);
+        intents.stop();
+        intents.request_mode_switch(0);
+        assert!(!intents.take_mode_cancellation());
+        assert_eq!(intents.take_mode_switch(), Some(0));
     }
 
     /// The body block has no intent behind it yet and must stay at the trained nominal.

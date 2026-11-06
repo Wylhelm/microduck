@@ -954,6 +954,10 @@ daemon, override the corresponding file settings for bench use.
 
 `robotd` re-reads `[policy]` — all of it but `mode` and `enabled` — when asked to, which is how
 `robotctl policy add` lands a skill without taking motor control away from a standing robot.
+`[policy] directory` optionally selects a local policy set, including its manifest, instead of
+`/opt/robot/policies/current`. Mode defaults and built-in skills resolve there; explicit slot
+and skill paths still win. A simulator uses this instead of overriding `walk`, so a live mode
+switch can select the roller gait from the same set.
 Re-reading `[safety]` or `[control]` under a running loop is a different and much larger promise,
 and it is still not made. `robotctl configure` knows which of the three answers a key wants, and
 a key that says nothing fails a test in `robotctl`.

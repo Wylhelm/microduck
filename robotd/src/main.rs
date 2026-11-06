@@ -2137,7 +2137,14 @@ fn load_mode(
     policy_params.mode = target;
     let cfg = policy_params.resolved();
     state.policy_error.store(None);
-    *controller = build_controller(&cfg, limp_fall, state);
+    let mut next = build_controller(&cfg, limp_fall, state);
+    if let (Some(previous), Some(next)) = (controller.as_ref(), next.as_mut())
+        && previous.is_sitting()
+        && next.has_sitstand()
+    {
+        next.carry_over(previous);
+    }
+    *controller = next;
     // Published together with the mode, and only after the load: a client that reads
     // `robot.mode` and gets the new one must not then be told the old mode's networks.
     state.policies.store(Arc::new(PolicyNames::of(&cfg)));
@@ -2277,6 +2284,7 @@ async fn control_loop<T: RobotIo>(
     // A mode switch in flight: the mode to end up in, once the robot is home. `None` the rest of
     // the time, which is nearly always.
     let mut mode_change: Option<Mode> = None;
+    let mut mode_support = false;
     // A policy load in flight, for the same reason and on the same path as `mode_change`: the
     // robot goes home first, and the swap happens there.
     let mut pending_swap: Option<PendingSwap> = None;
@@ -2465,7 +2473,14 @@ async fn control_loop<T: RobotIo>(
         let tick_start = Instant::now();
 
         let read_at = proto::clock::monotonic_ns();
-        let fresh = match safety.read() {
+        mode_support = (mode_change.is_some()
+            || (mode_support && matches!(bringup, Bringup::Homing { .. })))
+            && bringup != Bringup::Limp
+            && controller.as_ref().is_none_or(|c| !c.is_sitting());
+        let fresh = match safety
+            .set_drive_mode(policy_params.mode == Mode::Roller, mode_support)
+            .and_then(|()| safety.read())
+        {
             Ok(sensors) => {
                 state.consecutive_errors.store(0, Ordering::Relaxed);
                 sensors_read_ns = read_at;
@@ -2734,10 +2749,12 @@ async fn control_loop<T: RobotIo>(
 
         // A drive-mode switch: `robot.setMode`, which the pad's held D-pad up sends.
         //
-        // The robot goes back to its home pose first and the policies load there, for the reason
-        // the prototype relaunched into pose 0: swapping the network under a moving gait means the
-        // next tick is a different policy's idea of what the legs were doing. Torque stays on
-        // throughout — the robot holds itself up across the swap rather than sitting down.
+        // The simulator steadies the trunk during the existing home ramp; real hardware
+        // keeps its normal control path. An already seated robot stays seated.
+        if intents.take_mode_cancellation() && mode_change.is_some() {
+            mode_change = None;
+            tracing::warn!("mode switch cancelled by stop; keeping the current mode");
+        }
         if let Some(code) = intents.take_mode_switch() {
             let target = mode_of(code);
             if target == policy_params.mode {
@@ -2774,6 +2791,12 @@ async fn control_loop<T: RobotIo>(
                         from = policy_params.mode.as_str(),
                         to = target.as_str(),
                         "mode switch: swapping the policies now; the robot is limp and stays limp"
+                    );
+                } else if controller.as_ref().is_some_and(|c| c.is_sitting()) {
+                    tracing::warn!(
+                        from = policy_params.mode.as_str(),
+                        to = target.as_str(),
+                        "mode switch: settling in the seat before changing equipment"
                     );
                 } else {
                     tracing::warn!(
@@ -2839,6 +2862,23 @@ async fn control_loop<T: RobotIo>(
                     // Home the robot with the machinery `init` and a fall recovery already use: it
                     // ramps per tick, and `driving` is false until it reaches Ready. From a sample,
                     // which is where the ramp starts, so a blind tick waits for the next one.
+                    Bringup::Ready
+                        if controller.as_ref().is_some_and(|c| c.is_sitting())
+                            && snapshot.enabled =>
+                    {
+                        if controller.as_ref().is_some_and(|c| c.seat_settled()) {
+                            mode_change = None;
+                            load_mode(
+                                target,
+                                &mut policy_params,
+                                &mut policy_cfg,
+                                &mut controller,
+                                params.safety.limp_fall,
+                                &state,
+                                &slot_errors,
+                            );
+                        }
+                    }
                     Bringup::Ready => {
                         if let Some(sensors) = sensors.as_ref() {
                             bringup = Bringup::Homing {

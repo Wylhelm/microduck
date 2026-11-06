@@ -243,21 +243,11 @@ up() {
     build_daemons
     policies
 
-    # Every policy named explicitly: `RELEASE_DIR` is /opt/robot/daemon/current, which exists on a
-    # robot and not here, and `PolicyParams::resolved` uses a named path verbatim when it has one.
+    # Name the local set, not the walk slot: a walk override also wins in roller mode.
     cat > "$STATE/robotd.toml" <<TOML
 [policy]
 enabled = true
-# A robot's own defaults (deploy/robotd.toml): velstand walks and stands, and there is no separate
-# standing network. alpha_walking with alpha_stand is the pre-v5 pair, and it does not walk in
-# MuJoCo at all — commanded 0.15 m/s, it stands, in this simulator's own inference script too.
-walk = "$POLICIES/velstand.onnx"
-stand = "none"
-sitstand = "$POLICIES/alpha_sitstand.onnx"
-ground_pick = "$POLICIES/alpha_ground_pick.onnx"
-kick_left = "$POLICIES/ball_kick_left.onnx"
-kick_right = "$POLICIES/ball_kick_right.onnx"
-roulade = "$POLICIES/roulade.onnx"
+directory = "$POLICIES"
 
 # Singing is opt-in, and a room full of ducks that will not sing together is a poor demonstration
 # of a room full of ducks. On a real robot this is a decision someone makes; here it is the point.

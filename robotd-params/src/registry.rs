@@ -167,6 +167,11 @@ pub const REGISTRY: &[Entry] = &[
          is the mode a reboot comes back in",
     ),
     entry(
+        "policy.directory",
+        Kind::OptionalPath,
+        "Policy set directory; unset = the board's installed set. Keeps live mode selection",
+    ),
+    entry(
         "policy.skill",
         Kind::Table,
         "One-shot skills, in priority order — add and remove with `robotctl policy`",

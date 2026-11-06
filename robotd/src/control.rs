@@ -377,6 +377,10 @@ impl Controller {
         self.sit == Sit::Sitting
     }
 
+    pub fn seat_settled(&self) -> bool {
+        self.is_sitting() && self.sit_settle <= 0.0
+    }
+
     /// A scripted move is mid-flight. Sitting itself is not busy — a seated robot is
     /// parked, not travelling.
     pub fn busy(&self) -> bool {
