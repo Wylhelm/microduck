@@ -542,6 +542,13 @@ scale, voltage-adaptive scaling, the standing-transition gain change. These are 
 policies are *trained* with, so they must match training or transfer degrades. The rule is not
 to regress what already runs.
 
+**The roller gait's unused command slots must stay zero.** Its training uses
+`zero_command_padding` for the four head and six body slots. Before building the
+walking-network observation in roller mode, the controller preserves twist but
+zeros those pose commands. Idle head animation and a lingering walking pose must
+not become out-of-distribution roller inputs. Sit/stand keeps its own encoding;
+walking mode remains head/body steerable.
+
 ### 2.4 Safety
 
 `safety` owns the only `RobotIo` write handle. No policy and no client has one, so nothing

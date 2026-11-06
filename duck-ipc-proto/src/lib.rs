@@ -2734,6 +2734,9 @@ pub struct LoadPolicyParams {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PoliciesResult {
+    /// True only for `robotd --sim`: mode changes can steady a fallen simulated body.
+    #[serde(default)]
+    pub simulated: bool,
     /// `"walk"` or `"roller"` — which mode's slot defaults are in play.
     pub mode: String,
     /// Whether policies are loaded at all (`[policy] enabled`). False is a legitimate bench

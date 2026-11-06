@@ -65,6 +65,8 @@ pub struct Tuning {
     pub head_lowpass: Option<f64>,
     /// Same, for the ten leg joints. Trained with 0.7.
     pub legs_lowpass: Option<f64>,
+    /// Roller gait training zero-pads head/body commands, including while idle.
+    pub zero_pad_gait_pose: bool,
 }
 
 impl Default for Tuning {
@@ -76,6 +78,20 @@ impl Default for Tuning {
             gain: 200,
             head_lowpass: Some(0.5),
             legs_lowpass: Some(0.7),
+            zero_pad_gait_pose: false,
+        }
+    }
+}
+
+impl Tuning {
+    fn command_for(&self, net: Net, command: Command) -> Command {
+        if self.zero_pad_gait_pose && matches!(net, Net::Walk) {
+            Command {
+                twist: command.twist,
+                ..Command::default()
+            }
+        } else {
+            command
         }
     }
 }
@@ -654,6 +670,7 @@ impl Controller {
             }
         };
 
+        let effective = self.tuning.command_for(net, effective);
         self.last_net = Some(net);
 
         let observation = Observation::build(
@@ -771,6 +788,39 @@ impl Controller {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn roller_gait_zero_pads_untrained_pose_commands_but_not_sitstand() {
+        let command = Command {
+            twist: [0.2, 0.0, 0.0],
+            head: [0.3, -0.2, 0.4, 0.1],
+            body: duck_control::obs::BodyPose {
+                z: 0.01,
+                roll: 0.1,
+                pitch: -0.1,
+            },
+        };
+        let walk = Tuning::default();
+        let roller = Tuning {
+            zero_pad_gait_pose: true,
+            ..walk
+        };
+        assert_eq!(walk.command_for(Net::Walk, command), command);
+        assert_eq!(roller.command_for(Net::SitStand, command), command);
+        let padded = roller.command_for(Net::Walk, command);
+        assert_eq!(padded.twist, command.twist);
+        assert_eq!(padded.head, [0.0; 4]);
+        assert_eq!(padded.body, Default::default());
+        let observation = Observation::build(
+            &Default::default(),
+            &DEFAULT_POSITION,
+            &[0.0; NUM_JOINTS],
+            &DEFAULT_POSITION,
+            &[0.0; ACTION_LEN],
+            &padded,
+        );
+        assert_eq!(&observation.as_slice()[51..61], &[0.0; 10]);
+    }
 
     #[test]
     #[ignore = "requires ONNX Runtime >= 1.23"]

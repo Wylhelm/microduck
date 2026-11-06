@@ -134,6 +134,19 @@ connection closing also releases it. `read` exposes simulation-only `supported` 
 An already seated robot keeps its seat. This is a simulation convenience, not an autonomous
 equipment-change or balance policy; real hardware receives no artificial support.
 
+`robot.policies` publishes `simulated: true` only for `robotd --sim`. Clients can
+then request this assisted ramp after a fall, including by selecting the current
+mode again. Selecting `walk` after falling on skates also restores feet. A normal
+movement request remains subject to fall protection; recovery is not locomotion
+and does not demonstrate a learned stand-up skill.
+
+**Rendering must not clock physics.** A dedicated worker advances four 5 ms
+steps every 20 ms, independently of camera conversion, renderer recreation and
+viewer synchronisation. Rendering uses `VisualWorld`'s private snapshot on its
+own thread (the main thread for OpenGL), so a slow frame drops rendering rate
+instead of slowing the body while `robotd` keeps issuing targets at 50 Hz.
+Physics-worker exceptions propagate to the main loop, and shutdown joins it.
+
 `duck-sim` names its installed set with `[policy] directory`, so switching to roller selects
 `roller.onnx` and its crouch rather than retaining a walking-slot override. The standard
 board directory and explicitly overridden slots keep their existing semantics.

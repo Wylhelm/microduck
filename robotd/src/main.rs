@@ -756,6 +756,7 @@ struct RobotState {
     /// rather than read from the params it started as. An `AtomicU8` over [`Mode`] because it is
     /// read on the IPC side and written by the control loop, and there is nothing to allocate.
     mode: AtomicU8,
+    simulated: bool,
     /// Published by the loop so the IPC side can answer without consulting it.
     fallen: AtomicBool,
     /// The policy is driving and has been asked for a non-zero velocity.
@@ -842,6 +843,7 @@ impl RobotState {
             theremin_allowed: params.theremin.enabled && params.audio.enabled,
             chorale_accepted: params.chorale.accept,
             mode: AtomicU8::new(mode_code(params.policy.mode)),
+            simulated: false,
             fallen: AtomicBool::new(false),
             moving: AtomicBool::new(false),
             homed: AtomicBool::new(false),
@@ -1160,6 +1162,7 @@ async fn main() -> ExitCode {
     duck_ipc_proto::log_startup_identity!("robotd");
 
     let mut state = RobotState::new(&params, &params_path, args.unhealthy, args.busy);
+    state.simulated = args.sim.is_some();
     let vetbook_path = args.vetbook.clone().or_else(|| {
         (!args.fake && args.sim.is_none()).then(|| PathBuf::from(vetbook::DEFAULT_PATH))
     });
@@ -2045,6 +2048,7 @@ fn try_controller(
             gain: policy_cfg.gain,
             head_lowpass: policy_cfg.head_lowpass,
             legs_lowpass: policy_cfg.legs_lowpass,
+            zero_pad_gait_pose: policy_cfg.mode == Mode::Roller,
         };
         let skills = SkillTuning {
             ground_pick_period: policy_cfg.ground_pick_period,
@@ -2757,7 +2761,7 @@ async fn control_loop<T: RobotIo>(
         }
         if let Some(code) = intents.take_mode_switch() {
             let target = mode_of(code);
-            if target == policy_params.mode {
+            if target == policy_params.mode && !(state.simulated && safety.fallen()) {
                 tracing::info!(
                     mode = target.as_str(),
                     "already in that mode; nothing to switch"
@@ -5452,6 +5456,7 @@ fn dispatch(
         proto::Call::RobotPolicies => proto::Response::ok(
             Some(id),
             &proto::PoliciesResult {
+                simulated: state.simulated,
                 mode: mode_of(state.mode.load(Ordering::Relaxed))
                     .as_str()
                     .to_owned(),
