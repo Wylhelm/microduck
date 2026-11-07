@@ -2424,6 +2424,7 @@ async fn control_loop<T: RobotIo>(
     // The relocalize head sweep's clock; runs only while the mapper is
     // searching and the robot stands.
     let mut sweep_t = 0.0f64;
+    let mut maploc_moving = false;
     let mut body_ema = [0.0f64; 3];
 
     // Coasting over a dropped bus read, and where the robot actually is.
@@ -2704,7 +2705,7 @@ async fn control_loop<T: RobotIo>(
                         ],
                         // Last tick's verdict — 20 ms stale, and the stillness
                         // window on the worker side absorbs far more than that.
-                        moving: state.moving.load(Ordering::Relaxed),
+                        moving: maploc_moving,
                         sitting: controller.as_ref().is_some_and(|c| c.is_sitting()),
                         fallen: safety.fallen(),
                     });
@@ -3522,7 +3523,7 @@ async fn control_loop<T: RobotIo>(
             && maploc_host.as_ref().is_some_and(|host| {
                 host.searching() || params.maploc.mode == params::MaplocMode::StopAndScan
             })
-            && !state.moving.load(Ordering::Relaxed)
+            && !maploc_moving
             && !in_limp_fall
             && controller.as_ref().is_some_and(|c| !c.is_sitting());
         if sweeping {
@@ -4037,6 +4038,13 @@ async fn control_loop<T: RobotIo>(
             _ => (hold, policy_cfg.gain, false, "held".into()),
         };
         state.moving.store(moving, Ordering::Relaxed);
+        // Mapping's notion of a stop, narrower than `moving` (which `safeToRestart` reads and
+        // keeps as it was). The default velstand gait loads no standing network, so every
+        // policy tick is labelled `walk` and `moving` never drops while the robot stands: no
+        // stop-and-scan window, no head sweep. A walk tick asked for no more than the standing
+        // threshold is a stop to the mapper.
+        maploc_moving = moving
+            && !(policy_label == "walk" && command.twist_magnitude() <= DEFAULT_STANDING_THRESHOLD);
 
         // The theremin: a hand's distance in front of the beak, turned into a note and a
         // mouth opening. Before the mouth is written, because while an instrument is up it

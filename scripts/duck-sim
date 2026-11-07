@@ -777,8 +777,10 @@ wait_for_socket() {
 # had sent the intents, and "still upright after walking" was a duck that had never taken a step.
 drive() {
     [ -S "$SOCK" ] || die "no duck. \`scripts/duck-sim\` first."
-    say "walking for 8 s at vx ${1:-0.15} m/s, vyaw ${2:-0.0} rad/s"
-    python3 - "$SOCK" "$PORT" "${1:-0.15}" "${2:-0.0}" <<'PY'
+    # 0.3 rather than 0.15: the v9 velstand (v7's) stands still under about 0.2 m/s and
+    # 0.8 rad/s — measured in this sim, see docs/robot/simulation.md.
+    say "walking for 8 s at vx ${1:-0.3} m/s, vyaw ${2:-0.0} rad/s"
+    python3 - "$SOCK" "$PORT" "${1:-0.3}" "${2:-0.0}" <<'PY'
 import json, math, socket, sys, time
 sock, port, vx, vyaw = sys.argv[1], int(sys.argv[2]), float(sys.argv[3]), float(sys.argv[4])
 body = socket.create_connection(("127.0.0.1", port)).makefile("rw")
@@ -817,16 +819,16 @@ PY
 mapcheck() {
     [ -S "$SOCK" ] || die "no duck. \`scripts/duck-sim\` first."
     say "walk-and-stop route (~50 s): odometry and map pose against the simulator's truth"
-    python3 - "$SOCK" "$PORT" "${1:-0.15}" <<'PY'
+    python3 - "$SOCK" "$PORT" "${1:-0.3}" "${2:-1.0}" <<'PY'
 import json, math, socket, sys, threading, time
-sock, port, vx = sys.argv[1], int(sys.argv[2]), float(sys.argv[3])
+sock, port, vx, wz = sys.argv[1], int(sys.argv[2]), float(sys.argv[3]), float(sys.argv[4])
 body = socket.create_connection(("127.0.0.1", port)).makefile("rw")
 body.write(json.dumps({"op": "hello", "protocol": 1, "joints": 15}) + "\n"); body.flush(); body.readline()
 def truth():
     body.write('{"op":"read"}\n'); body.flush(); r = json.loads(body.readline())
     w, x, y, z = r["imu"]["quat"]
     return r["trunk"][0], r["trunk"][1], math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
-latest = {"odom": None, "map": None, "maps": 0, "info": None}
+latest = {"odom": None, "map": None, "maps": 0, "info": None, "policy": None}
 def subscribe(method, params):
     s = socket.socket(socket.AF_UNIX); s.connect(sock); f = s.makefile("rw")
     f.write(json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}) + "\n"); f.flush()
@@ -835,6 +837,7 @@ def subscribe(method, params):
         if m.get("id") == 1:
             latest["info" if method == "robot.map" else "sub"] = m.get("result", m.get("error"))
         elif m.get("method") == "robot.state":
+            latest["policy"] = m["params"].get("policy")
             o = m["params"].get("odom") or {}
             if "position" in o:
                 latest["odom"] = (o["position"][0], o["position"][1], o["yaw"])
@@ -852,9 +855,9 @@ print("   robot.map answered:", latest["info"])
 t0, o0, m0 = truth(), latest["odom"], latest["map"]
 if o0 is None:
     sys.exit("   no robot.state odom arrived")
-route = [(0, 0, 6), (vx, 0, 5), (0, 0, 6), (0, 0.6, 4), (0, 0, 6), (vx, 0, 5), (0, 0, 6), (0, -0.6, 4), (0, 0, 6)]
+route = [(0, 0, 6), (vx, 0, 5), (0, 0, 6), (0, wz, 4), (0, 0, 6), (vx, 0, 5), (0, 0, 6), (0, -wz, 4), (0, 0, 6)]
 path, last_t, start = 0.0, t0, time.time()
-print("     t  | truth dx   dy   dyaw | odom err cm  yaw deg | map err cm  yaw deg trk win sub seq")
+print("     t  | truth dx   dy   dyaw | odom err cm  yaw deg | map err cm  yaw deg trk win sub seq policy")
 def row():
     t = truth(); tr = rel(t, t0); od = rel(latest["odom"], o0)
     e_o = math.hypot(od[0] - tr[0], od[1] - tr[1]) * 100
@@ -865,7 +868,7 @@ def row():
         mp = rel(m[:3], m0[:3])
         e_m = math.hypot(mp[0] - tr[0], mp[1] - tr[1]) * 100
         y_m = math.degrees(math.atan2(math.sin(mp[2] - tr[2]), math.cos(mp[2] - tr[2])))
-        out += f" | {e_m:7.1f} {y_m:+7.1f} {int(m[3])} {m[4]:3d} {m[5]:3d} {m[6]}"
+        out += f" | {e_m:7.1f} {y_m:+7.1f} {int(m[3])} {m[4]:3d} {m[5]:3d} {m[6]} {latest['policy']}"
     elif m:
         out += f" | (first map frame came late) trk={int(m[3])} seq={m[6]}"
     else:
