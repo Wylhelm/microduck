@@ -644,10 +644,19 @@ start_body() {
     # the *subshell's* pid, because `A && B & C` parses as `(A && B) & C` — so `down` killed a
     # wrapper and left MuJoCo running as an orphan. `setsid` puts the simulator in its own process
     # group, which is what makes stopping it one signal rather than a hunt.
+    set -- --port "$PORT" --ducks "$DUCKS" --keyframe "${DUCK_SIM_KEYFRAME:-SIT}"
+    if [ -n "$HEADLESS" ]; then
+        set -- "$@" "$HEADLESS"
+    fi
     case "$SCENE" in
-        "")   scene_arg="" ;;
-        */*)  scene_arg="--scene $SCENE" ;;
-        *)    scene_arg="--scene $RL/src/mjlab_microduck/robot/microduck/scene_$SCENE.xml" ;;
+        "")   ;;
+        */*)  set -- "$@" --scene "$SCENE" ;;
+        *)    set -- "$@" --scene "$RL/src/mjlab_microduck/robot/microduck/scene_$SCENE.xml" ;;
+    esac
+    case "${DUCK_SIM_PRELOAD_EQUIPMENT:-0}" in
+        0) ;;
+        1) set -- "$@" --preload-equipment ;;
+        *) die "DUCK_SIM_PRELOAD_EQUIPMENT must be 0 or 1" ;;
     esac
     # **The camera flags go with the cameras.** Rendering is newer than the body server, and a
     # build without it has no `--cameras`/`--frame-port` — argparse then refuses the whole
@@ -662,9 +671,8 @@ start_body() {
     # line that would mean something if the simulator really were falling behind. 30 costs about a
     # third of a core per camera, which is the trade `DUCK_SIM_CAMERAS` already exists to let you
     # decline.
-    cam_args=""
     if [ -n "$CAMERAS" ]; then
-        cam_args="--cameras $CAMERAS --frame-port $FRAME_PORT --camera-fps 30"
+        set -- "$@" --cameras "$CAMERAS" --frame-port "$FRAME_PORT" --camera-fps 30
     fi
     # WSL2: without these, Mesa falls back to llvmpipe (software GL) and the viewer crawls.
     # Respect any value the caller already set.
@@ -673,9 +681,7 @@ start_body() {
         export MESA_D3D12_DEFAULT_ADAPTER_NAME="${MESA_D3D12_DEFAULT_ADAPTER_NAME:-NVIDIA}"
     fi
     # shellcheck disable=SC2086
-    $SETSID nohup "$PY_BIN" -m mjlab_microduck.sim.body_server \
-        --port "$PORT" --ducks "$DUCKS" --keyframe "${DUCK_SIM_KEYFRAME:-SIT}" $HEADLESS $scene_arg \
-        $cam_args \
+    $SETSID nohup "$PY_BIN" -m mjlab_microduck.sim.body_server "$@" \
         > "$STATE/body.log" 2>&1 &
     echo $! > "$STATE/body.pid"
     if ! wait_for_port; then
@@ -702,7 +708,9 @@ WHY
 
 wait_for_port() {
     i=0
-    while [ $i -lt 100 ]; do
+    # Two precompiled equipment models can take longer for detailed scanned scenes.
+    [ "${DUCK_SIM_PRELOAD_EQUIPMENT:-0}" = 1 ] && limit=300 || limit=100
+    while [ $i -lt "$limit" ]; do
         # Not /dev/tcp: that is a bash builtin and this is #!/bin/sh, which is dash on Debian
         # and Ubuntu. python3 is already required by `drive`, so it is the portable knock.
         if python3 -c "import socket,sys;s=socket.socket();s.settimeout(.3);sys.exit(s.connect_ex(('127.0.0.1',$PORT)))" 2>/dev/null; then
@@ -1052,8 +1060,8 @@ CONF
         fi
         say "booting $name (body on port $(duck_port "$i"))"
         # An empty AUDIO_BIND must pass no argument at all, so the word split is the point — the
-        # same shape as the four other deliberately unquoted lists here: `$mediad_features`, two
-        # calls' `$args`, and the body server's `$HEADLESS $scene_arg $cam_args`.
+        # same shape as the other deliberately unquoted lists here: `$mediad_features` and two
+        # calls' `$args`.
         # shellcheck disable=SC2086
         sudo systemd-run --collect --unit="$name" --quiet \
             systemd-nspawn -D "$upper/merged" --machine="$name" --boot \

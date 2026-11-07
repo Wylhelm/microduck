@@ -162,6 +162,7 @@ Environment variables, all optional:
 | `DUCK_SIM_STATE` | `~/.cache/duck-sim` | Sockets, logs, params, the rootfs and the ducks' overlays. Short on purpose: a unix socket path is capped at about 108 bytes. |
 | `DUCK_SIM_DUCKS` | `1` | How many ducks; `boot N` sets it too. |
 | `DUCK_SIM_SCENE` | bare floor | A scene name (`apartment`) or a path. |
+| `DUCK_SIM_PRELOAD_EQUIPMENT` | `0` | Set to `1` for one duck to compile both walking and roller models at startup, using more memory but avoiding recompilation during mode changes. |
 | `DUCK_SIM_CAMERAS` | none | Which ducks render a camera: `a`, `a,c`, `all`. |
 | `DUCK_SIM_DUCK` | `duck-a` | Which duck `ctl` and `monitor` talk to. |
 | `DUCK_SIM_KEYFRAME` | `SIT` | Where a duck starts: `SIT` folded on the floor (the standing policy rises from it), `HOME`, `STAND`, `FOLD`. |
