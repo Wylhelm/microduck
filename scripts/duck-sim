@@ -666,6 +666,12 @@ start_body() {
     if [ -n "$CAMERAS" ]; then
         cam_args="--cameras $CAMERAS --frame-port $FRAME_PORT --camera-fps 30"
     fi
+    # WSL2: without these, Mesa falls back to llvmpipe (software GL) and the viewer crawls.
+    # Respect any value the caller already set.
+    if [ -e /dev/dxg ]; then
+        export GALLIUM_DRIVER="${GALLIUM_DRIVER:-d3d12}"
+        export MESA_D3D12_DEFAULT_ADAPTER_NAME="${MESA_D3D12_DEFAULT_ADAPTER_NAME:-NVIDIA}"
+    fi
     # shellcheck disable=SC2086
     $SETSID nohup "$PY_BIN" -m mjlab_microduck.sim.body_server \
         --port "$PORT" --ducks "$DUCKS" --keyframe "${DUCK_SIM_KEYFRAME:-SIT}" $HEADLESS $scene_arg \
@@ -905,6 +911,9 @@ stage() {
         mkdir -p "$REL/bin" "$REL/policies" "$ROOTFS/etc/systemd/system/robotd.service.d"
         install -m755 "$REPO/target/debug/robotd" "$REPO/target/debug/robotctl" "$REL/bin/"
         cp "$REPO"/policies/*.onnx "$REL/policies/"
+        # robotd reads its set from /opt/robot/policies/current, outside the release, as on a board
+        mkdir -p "$ROOTFS/opt/robot/policies/current"
+        cp "$REPO"/policies/*.onnx "$REPO"/policies/manifest.json "$ROOTFS/opt/robot/policies/current/" 2>/dev/null || cp "$REPO"/policies/*.onnx "$ROOTFS/opt/robot/policies/current/"
         ln -sfn /opt/robot/daemon/releases/sim "$ROOTFS/opt/robot/daemon/current"
         # On PATH, because the first thing anybody types after logging into a duck is `robotctl`
         # and `command not found` is a poor greeting. A symlink rather than a profile.d line: it
