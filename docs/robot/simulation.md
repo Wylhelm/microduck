@@ -119,6 +119,25 @@ ended with odometry 13.5 cm off (8.4 % of the path) and 0.1° off in yaw, and th
 map walls to localize against, but carries the robot without backlash, so the duck does not walk in
 it yet.
 
+## Realism, obstacles and no assist
+
+```sh
+scripts/duck-sim --realism real --realism-seed 7      # the trained envelope; `hard` is past it
+scripts/duck-sim --no-assist                          # no simulation-only hand
+scripts/duck-sim --obstacles room.json --obstacle-slots 4
+scripts/duck-sim --maploc --realism real up           # options come before the command
+```
+
+Each option only exports the body server's variable before it starts — `DUCK_SIM_REALISM`
+(`off`, the default ideal twin), `DUCK_SIM_REALISM_SEED`, `DUCK_SIM_NO_ASSIST=1`,
+`DUCK_SIM_OBSTACLES` (made absolute; the file must exist) and `DUCK_SIM_OBSTACLE_SLOTS` — so setting
+them in the environment is the same thing. The body server (in `microduck_rl`) documents what each
+one does; an example obstacles file is `microduck_rl/src/mjlab_microduck/sim/examples/obstacles_appartement.json`.
+
+`down` never asks for a password: in the plain form there is nothing for `sudo` to stop, and with
+containers it uses `sudo -n` and says what it could not stop. It also stops a `mediad --sim-camera`
+that an earlier `up` started and that was relaunched by hand with the same configuration file.
+
 ## Several ducks, each a machine you log into
 
 ```sh
