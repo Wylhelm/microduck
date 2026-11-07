@@ -897,7 +897,9 @@ impl Server {
             | Call::RobotVetbookTally(_)
             | Call::RobotLoadPolicy(_)
             | Call::RobotReloadPolicies
-            | Call::RobotSubscribe(_) => Response::err(
+            | Call::RobotSubscribe(_)
+            | Call::RobotMap
+            | Call::RobotMapWipe => Response::err(
                 Some(id),
                 proto::Error::new(
                     proto::code::METHOD_NOT_FOUND,
