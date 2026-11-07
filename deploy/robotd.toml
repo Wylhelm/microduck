@@ -391,7 +391,7 @@ mode = "walk"
 [maploc]
 # Mapping & localization. Off by default: it is the most CPU-hungry thing the robot can
 # do, and a duck that is not being asked to map should not pay for it. When on, robotd
-# builds an occupancy map from the head ToF (needs tofd running) and contact odometry,
+# builds an occupancy map from the head ToF (tofd, at [theremin] socket) and contact odometry,
 # persists it across restarts, and serves it live to `robotctl monitor` — the path panel
 # becomes the map (`m` makes it fullscreen).
 # enabled = false

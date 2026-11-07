@@ -3,6 +3,8 @@
 #
 #   scripts/duck-sim              # a window opens, the duck stands up, and it is yours
 #   scripts/duck-sim drive        # walk it forward for a few seconds
+#   scripts/duck-sim --maploc     # the same, with mapping & localization on (DUCK_SIM_MAPLOC=1)
+#   scripts/duck-sim mapcheck     # walk-and-stop route: odometry and map pose against the truth
 #   scripts/duck-sim ctl health   # anything robotctl does
 #   scripts/duck-sim down
 #
@@ -70,6 +72,12 @@ SCENE="${DUCK_SIM_SCENE:-backlash}"
 # 8080 + its index.
 CAMERAS="${DUCK_SIM_CAMERAS:-}"
 FRAME_PORT="${DUCK_SIM_FRAME_PORT:-7901}"
+
+# Mapping & localization (`[maploc]`), off by default as on a robot. `1` (or `--maploc` before the
+# command) turns it on in its default `stop_and_scan` mode; `continuous` picks that mode instead.
+# The map is fed by the duck's own simulated ToF through `tofd --sim`, and persists per scene in
+# the state directory, the way a robot keeps /var/lib/robot/maploc.session across reboots.
+MAPLOC="${DUCK_SIM_MAPLOC:-0}"
 SOCK="$STATE/duck.sock"
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 
@@ -220,12 +228,34 @@ policies() {
         return 0
     fi
     POLICIES="$STATE/policies/current"
-    [ -f "$POLICIES/velstand.onnx" ] || {
-        say "no policy set here — fetching the official one"
-        sh "$REPO/scripts/seed-policies.sh" "$STATE/policies" || true
-    }
+    # Every start, not only when nothing is there: a robot runs this on every update, and it is
+    # what moves a set below the daemon's pin up to it (v8 -> v9). It touches nothing when the
+    # set is at or past the pin, or not ours, and needs no network then.
+    [ -f "$POLICIES/velstand.onnx" ] || say "no policy set here — fetching the official one"
+    sh "$REPO/scripts/seed-policies.sh" "$STATE/policies" || true
     [ -f "$POLICIES/velstand.onnx" ] ||
         die "no velstand.onnx in $STATE/policies. It needs the network once, or your own set (v5 or later) in $REPO/policies."
+}
+
+# The `[maploc]` section, or nothing. `DUCK` in the map path becomes each duck's name, like the
+# sound bank; the scene is in it too, because a map of one world is a wrong map of another.
+maploc_section() {
+    case "$MAPLOC" in
+        0 | "") return 0 ;;
+        1 | stop_and_scan) mode=stop_and_scan ;;
+        continuous) mode=continuous ;;
+        *) die "DUCK_SIM_MAPLOC must be 0, 1, stop_and_scan or continuous" ;;
+    esac
+    scene_tag="$(printf %s "$(basename "$SCENE" .xml)" | tr -c 'A-Za-z0-9_-' '_')"
+    cat <<TOML
+
+# DUCK_SIM_MAPLOC: mapping & localization from the simulated ToF, fed by this duck's tofd --sim
+# over the depth socket named in [theremin].
+[maploc]
+enabled = true
+mode = "$mode"
+map_path = "$STATE/DUCK-maploc-$scene_tag.session"
+TOML
 }
 
 up() {
@@ -273,6 +303,7 @@ dir = "$REPO/robotd/emotions"
 [theremin]
 socket = "$STATE/DUCK-tof.sock"
 TOML
+    maploc_section >> "$STATE/robotd.toml"
 
     # **A voice each, and it is not decoration.** `robotctl chorale` refuses without one — but more
     # than that, `robotd` takes its chorale id from the seed recorded in the bank it plays from, and
@@ -284,6 +315,7 @@ TOML
     while [ "$i" -lt "$DUCKS" ]; do
         name="$(duck_name "$i")"
         sed -e "s|/sounds/DUCK|/sounds/$name|" -e "s|/DUCK-tof.sock|/$name-tof.sock|" \
+            -e "s|/DUCK-maploc-|/$name-maploc-|" \
             "$STATE/robotd.toml" > "$STATE/robotd-$name.toml"
         if [ ! -d "$STATE/sounds/$name" ]; then
             say "rendering $name a voice"
@@ -777,6 +809,83 @@ PY
     say "stopped — the intent expires on its own"
 }
 
+# Contact odometry and the maploc pose against the simulator's ground truth, over a short
+# walk-and-stop route. The truth is the body server's trunk pose, which a robot does not have —
+# this is how far the duck's own estimates are from it. Both estimates are compared as
+# displacements from where the route started, each in its own starting frame, so neither needs
+# to share an origin with the world.
+mapcheck() {
+    [ -S "$SOCK" ] || die "no duck. \`scripts/duck-sim\` first."
+    say "walk-and-stop route (~50 s): odometry and map pose against the simulator's truth"
+    python3 - "$SOCK" "$PORT" "${1:-0.15}" <<'PY'
+import json, math, socket, sys, threading, time
+sock, port, vx = sys.argv[1], int(sys.argv[2]), float(sys.argv[3])
+body = socket.create_connection(("127.0.0.1", port)).makefile("rw")
+body.write(json.dumps({"op": "hello", "protocol": 1, "joints": 15}) + "\n"); body.flush(); body.readline()
+def truth():
+    body.write('{"op":"read"}\n'); body.flush(); r = json.loads(body.readline())
+    w, x, y, z = r["imu"]["quat"]
+    return r["trunk"][0], r["trunk"][1], math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+latest = {"odom": None, "map": None, "maps": 0, "info": None}
+def subscribe(method, params):
+    s = socket.socket(socket.AF_UNIX); s.connect(sock); f = s.makefile("rw")
+    f.write(json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}) + "\n"); f.flush()
+    for line in f:
+        m = json.loads(line)
+        if m.get("id") == 1:
+            latest["info" if method == "robot.map" else "sub"] = m.get("result", m.get("error"))
+        elif m.get("method") == "robot.state":
+            o = m["params"].get("odom") or {}
+            if "position" in o:
+                latest["odom"] = (o["position"][0], o["position"][1], o["yaw"])
+        elif m.get("method") == "map.frame":
+            p = m["params"]; latest["maps"] += 1
+            latest["map"] = (p["x"], p["y"], p["yaw"], p["tracking"], p["windows"], p["n_submaps"], p["seq"])
+threading.Thread(target=subscribe, args=("robot.subscribe", {"hz": 10}), daemon=True).start()
+threading.Thread(target=subscribe, args=("robot.map", {}), daemon=True).start()
+ctl = socket.socket(socket.AF_UNIX); ctl.connect(sock); cf = ctl.makefile("w")
+def rel(p, p0):
+    dx, dy = p[0] - p0[0], p[1] - p0[1]; c, s = math.cos(-p0[2]), math.sin(-p0[2])
+    return c * dx - s * dy, s * dx + c * dy, math.atan2(math.sin(p[2] - p0[2]), math.cos(p[2] - p0[2]))
+time.sleep(2.0)
+print("   robot.map answered:", latest["info"])
+t0, o0, m0 = truth(), latest["odom"], latest["map"]
+if o0 is None:
+    sys.exit("   no robot.state odom arrived")
+route = [(0, 0, 6), (vx, 0, 5), (0, 0, 6), (0, 0.6, 4), (0, 0, 6), (vx, 0, 5), (0, 0, 6), (0, -0.6, 4), (0, 0, 6)]
+path, last_t, start = 0.0, t0, time.time()
+print("     t  | truth dx   dy   dyaw | odom err cm  yaw deg | map err cm  yaw deg trk win sub seq")
+def row():
+    t = truth(); tr = rel(t, t0); od = rel(latest["odom"], o0)
+    e_o = math.hypot(od[0] - tr[0], od[1] - tr[1]) * 100
+    y_o = math.degrees(math.atan2(math.sin(od[2] - tr[2]), math.cos(od[2] - tr[2])))
+    out = f"  {time.time() - start:5.1f} | {tr[0]:+.2f} {tr[1]:+.2f} {math.degrees(tr[2]):+5.0f} | {e_o:7.1f} {y_o:+7.1f}"
+    m = latest["map"]
+    if m and m0:
+        mp = rel(m[:3], m0[:3])
+        e_m = math.hypot(mp[0] - tr[0], mp[1] - tr[1]) * 100
+        y_m = math.degrees(math.atan2(math.sin(mp[2] - tr[2]), math.cos(mp[2] - tr[2])))
+        out += f" | {e_m:7.1f} {y_m:+7.1f} {int(m[3])} {m[4]:3d} {m[5]:3d} {m[6]}"
+    elif m:
+        out += f" | (first map frame came late) trk={int(m[3])} seq={m[6]}"
+    else:
+        out += " | no map frame"
+    print(out, flush=True)
+    return t, e_o, y_o
+for v, w, secs in route:
+    for i in range(int(secs * 10)):
+        if v or w:
+            cf.write(json.dumps({"jsonrpc": "2.0", "method": "robot.move",
+                                 "params": {"vx": v, "vy": 0.0, "vyaw": w}}) + "\n"); cf.flush()
+        time.sleep(0.1)
+        if i % 10 == 9:
+            t, e_o, y_o = row()
+            path += math.dist(t[:2], last_t[:2]); last_t = t
+print(f"   path {path:.2f} m: final odometry error {e_o:.1f} cm ({e_o / max(path * 100, 1e-6) * 100:.1f}% of path), "
+      f"yaw {y_o:+.1f} deg; map frames received {latest['maps']}")
+PY
+}
+
 # How fast the world is actually running. The daemons' loops are wall-clock, so a simulator below
 # real time is not merely slow to watch — the policies are driving robots that move less than they
 # expect, and they cannot balance one. Reported rather than left to be felt.
@@ -1147,6 +1256,11 @@ shell() {
     sudo machinectl shell "${1:-$(duck_name 0)}"
 }
 
+if [ "${1:-}" = --maploc ]; then
+    MAPLOC="${MAPLOC#0}"; MAPLOC="${MAPLOC:-1}"
+    shift
+fi
+
 case "${1:-up}" in
     up|"")   up ;;
     rootfs)  rootfs ;;
@@ -1154,6 +1268,7 @@ case "${1:-up}" in
     shell)   shift; shell "$@" ;;
     down)    down_containers; down ;;
     drive)   shift; drive "$@" ;;
+    mapcheck) shift; mapcheck "$@" ;;
     ctl)     shift; ctl "$@" ;;
     stand)   stand && sleep 6 && upright ;;
     status)  ctl health | head -4; upright ;;
@@ -1161,5 +1276,5 @@ case "${1:-up}" in
     log)     tail -f "$STATE/robotd.log" ;;
     simlog)  tail -f "$STATE/body.log" ;;
     realtime) realtime ;;
-    *)       die "unknown command '$1'. Try: up, boot, shell, down, stand, drive, monitor, ctl, log, simlog, status, realtime" ;;
+    *)       die "unknown command '$1'. Try: up, boot, shell, down, stand, drive, mapcheck, monitor, ctl, log, simlog, status, realtime" ;;
 esac

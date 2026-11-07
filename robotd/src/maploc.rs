@@ -135,9 +135,12 @@ impl Host {
 }
 
 /// Start the worker and its tofd feed. `map_tx` is where rendered maps go;
-/// the connection handler hands subscribers its receivers.
+/// the connection handler hands subscribers its receivers. `tof_socket` is
+/// tofd's depth stream — the same path the theremin reads (`theremin.socket`),
+/// which is `/run/tofd/tof.sock` on a robot and one per duck in the simulator.
 pub fn spawn(
     params: MaplocParams,
+    tof_socket: std::path::PathBuf,
     map_tx: tokio::sync::broadcast::Sender<proto::MapFrame>,
 ) -> Host {
     let (tx, rx) = mpsc::sync_channel(EVENT_BUFFER);
@@ -175,7 +178,7 @@ pub fn spawn(
                 .enable_time()
                 .build()
             {
-                Ok(rt) => rt.block_on(feed_tof(feed)),
+                Ok(rt) => rt.block_on(feed_tof(feed, tof_socket)),
                 Err(e) => tracing::error!(error = %e, "maploc: no runtime for the tofd feed"),
             }
         })
@@ -615,12 +618,12 @@ fn frame_from(mapper: &Mapper, grid: &RenderedGrid, seq: u64, seated: bool) -> p
 /// Subscribe to `tofd`'s depth stream and pump frames into the host.
 /// Reconnects with backoff forever: tofd restarting (or absent on a board
 /// with no sensor) idles mapping, nothing more.
-async fn feed_tof(host: Host) {
+async fn feed_tof(host: Host, socket: std::path::PathBuf) {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     let mut backoff = Duration::from_millis(500);
     loop {
-        match tokio::net::UnixStream::connect(proto::socket::TOF).await {
+        match tokio::net::UnixStream::connect(&socket).await {
             Ok(stream) => {
                 tracing::info!("maploc: connected to tofd's depth stream");
                 backoff = Duration::from_millis(500);
