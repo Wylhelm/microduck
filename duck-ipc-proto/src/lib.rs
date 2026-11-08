@@ -522,7 +522,15 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// `candidates` on [`PadPairResult::Failed`]: an `ambiguous` refusal lists the pads it saw, so a
 /// client can offer them and pair one by `mac`. Additive: an older `configd` omits it, which
 /// reads as an empty list, and a client that does not know it ignores it.
-pub const API_VERSION: u32 = 51;
+///
+/// # v52 — `robot.map`, `robot.map_wipe`
+///
+/// The live occupancy map, when `[maploc]` is enabled in robotd.toml. `robot.map` is a
+/// subscription like `robot.state`: the answer says whether mapping runs, then `map.frame`
+/// notifications carry the rendered grid and the map-frame pose at a slow cadence.
+/// `robot.map_wipe` resets the mapping session in place and deletes its saved file — the
+/// experiment reset button.
+pub const API_VERSION: u32 = 52;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -1083,6 +1091,19 @@ pub mod method {
     /// One 8×8 depth frame, pushed after [`TOF_STREAM`].
     pub const TOF_FRAME: &str = "tof.frame";
 
+    /// Subscribe to the live occupancy map (`[maploc]` must be enabled in
+    /// robotd.toml). The answer says whether mapping runs; frames then
+    /// arrive as [`MAP_FRAME`] notifications at a slow cadence.
+    pub const ROBOT_MAP: &str = "robot.map";
+
+    /// Wipe the mapping session: the map, the pose graph, the tracked pose
+    /// and any suspicion all reset, and the saved session file is deleted.
+    /// The experiment reset button — no ssh, no daemon restart.
+    pub const ROBOT_MAP_WIPE: &str = "robot.map_wipe";
+
+    /// One rendered map, pushed after [`ROBOT_MAP`].
+    pub const MAP_FRAME: &str = "map.frame";
+
     /// Subscribe to the head IMU. Served by `tofd` on `zero3` (the BMI088 on the HAT, same I²C
     /// bus as the ToF) and by `robotd` on `beta` (the face board's LSM6DSV16X); the other daemon
     /// answers with `unavailable` naming the right one. The answer describes the sensor, then
@@ -1332,6 +1353,10 @@ pub enum Call {
     /// Subscribe to the head IMU (`tofd` on zero3, `robotd` on beta); see
     /// [`method::HEAD_IMU_STREAM`].
     HeadImuStream,
+    /// Subscribe to the live occupancy map. Answered by `robotd`.
+    RobotMap,
+    /// Reset the mapping session — see [`method::ROBOT_MAP_WIPE`].
+    RobotMapWipe,
 }
 
 /// The service that owns the answer to a call.
@@ -1471,6 +1496,8 @@ impl Call {
             Call::PadInput => method::PAD_INPUT,
             Call::TofStream => method::TOF_STREAM,
             Call::HeadImuStream => method::HEAD_IMU_STREAM,
+            Call::RobotMap => method::ROBOT_MAP,
+            Call::RobotMapWipe => method::ROBOT_MAP_WIPE,
         }
     }
 
@@ -1645,6 +1672,10 @@ impl Call {
             | Call::RobotReloadPolicies
             | Call::RobotShutdown => (Robot, Prompt),
             Call::RobotSubscribe(_) => (Robot, Stream),
+            // The live map is a subscription like `robot.subscribe`; the wipe stores an
+            // event the mapping worker takes on its next spin, like any intent.
+            Call::RobotMap => (Robot, Stream),
+            Call::RobotMapWipe => (Robot, Prompt),
             // `btd` asking what to put on the air. The answering connection carries the beacon
             // stream down and `chorale.heard` notifications up.
             Call::ChoraleSubscribe => (Robot, Stream),
@@ -1811,7 +1842,9 @@ impl Call {
             | Call::PadInput
             | Call::TofStream
             | Call::HeadImuStream
-            | Call::ChoraleSubscribe => Value::Object(serde_json::Map::new()),
+            | Call::ChoraleSubscribe
+            | Call::RobotMap
+            | Call::RobotMapWipe => Value::Object(serde_json::Map::new()),
         }
     }
 
@@ -1932,6 +1965,8 @@ impl Call {
             method::PAD_INPUT => Call::PadInput,
             method::TOF_STREAM => Call::TofStream,
             method::HEAD_IMU_STREAM => Call::HeadImuStream,
+            method::ROBOT_MAP => Call::RobotMap,
+            method::ROBOT_MAP_WIPE => Call::RobotMapWipe,
             other => {
                 return Err(Error::new(
                     code::METHOD_NOT_FOUND,
@@ -2144,6 +2179,8 @@ pub mod test_support {
             Call::PadInput,
             Call::TofStream,
             Call::HeadImuStream,
+            Call::RobotMap,
+            Call::RobotMapWipe,
         ]
     }
 }
@@ -2259,6 +2296,24 @@ impl Request {
     /// Read a head-IMU notification back.
     pub fn as_head_imu_frame(&self) -> Option<HeadImuFrame> {
         if self.method != method::HEAD_IMU_FRAME {
+            return None;
+        }
+        serde_json::from_value(self.params.clone()?).ok()
+    }
+
+    /// A map notification: no `id`, so no response is expected.
+    pub fn notify_map_frame(frame: &MapFrame) -> Self {
+        Self {
+            jsonrpc: JSONRPC_VERSION.to_owned(),
+            id: None,
+            method: method::MAP_FRAME.to_owned(),
+            params: Some(serde_json::to_value(frame).unwrap_or(Value::Null)),
+        }
+    }
+
+    /// Read a map notification back.
+    pub fn as_map_frame(&self) -> Option<MapFrame> {
+        if self.method != method::MAP_FRAME {
             return None;
         }
         serde_json::from_value(self.params.clone()?).ok()
@@ -2762,6 +2817,9 @@ pub struct LoadPolicyParams {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PoliciesResult {
+    /// True only for `robotd --sim`: mode changes can steady a fallen simulated body.
+    #[serde(default)]
+    pub simulated: bool,
     /// `"walk"` or `"roller"` — which mode's slot defaults are in play.
     pub mode: String,
     /// Whether policies are loaded at all (`[policy] enabled`). False is a legitimate bench
@@ -5356,6 +5414,141 @@ pub struct TofFrame {
     pub status: Vec<u8>,
 }
 
+/// Answer to [`Call::RobotMap`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MapStreamResult {
+    /// The subscription is held either way — frames flow if mapping is later
+    /// enabled — mirroring [`TofStreamResult::accepted`]'s reasoning.
+    pub accepted: bool,
+    /// Whether `[maploc]` is enabled on this robot.
+    pub enabled: bool,
+    /// `stop_and_scan` or `continuous`, when enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+}
+
+/// One rendered occupancy map, pushed at a slow cadence after [`Call::RobotMap`].
+///
+/// The grid is trinary — a viewer needs walls, floor and fog, not sixteen bits
+/// of log-odds — and rides as base64 (see [`b64`]) because 30 k cells as a
+/// JSON number array would triple the frame for nothing.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MapFrame {
+    /// Renders since mapping started, so a viewer can see a gap it did not cause.
+    pub seq: u64,
+    /// The robot's pose in the MAP frame (which equals the odometry frame
+    /// until a relocalization or loop closure says otherwise).
+    pub x: f64,
+    pub y: f64,
+    pub yaw: f64,
+    /// False while the pose is not to be trusted (searching, or no map yet).
+    pub tracking: bool,
+    /// World coordinates of cell (0, 0)'s corner, and the cell pitch.
+    pub x_min: f32,
+    pub y_min: f32,
+    pub cell_m: f32,
+    /// Grid dimensions: `cells` decodes to `rows × cols` bytes, row-major,
+    /// row 0 at `y_min`.
+    pub rows: u32,
+    pub cols: u32,
+    /// Base64 of one byte per cell: 0 unknown, 1 free, 2 wall.
+    pub cells: String,
+    pub n_submaps: u32,
+    pub n_loops: u32,
+    /// Still-windows integrated so far — the number that says whether the
+    /// robot's stops are actually reaching the map. A map that "shows
+    /// nothing" with `windows: 0` is a robot that never stood still long
+    /// enough; with `windows: 30` it is a rendering question.
+    #[serde(default)]
+    pub windows: u32,
+    /// Whether the mapper currently believes the robot is standing still
+    /// (i.e. a scan window is accumulating right now).
+    #[serde(default)]
+    pub still: bool,
+    /// Seated (or fallen): the mapper refuses to map or relocalize from
+    /// the floor, so a "searching" that never ends while this is set is
+    /// a robot waiting to be stood up — a field test spent three minutes
+    /// puzzling over exactly that.
+    #[serde(default)]
+    pub seated: bool,
+}
+
+/// Standard base64 (RFC 4648, with padding), owned here so both ends of
+/// [`MapFrame::cells`] spell it identically and no client needs a dependency
+/// to read a map.
+pub mod b64 {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    pub fn encode(data: &[u8]) -> String {
+        let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+        for chunk in data.chunks(3) {
+            let b = [
+                chunk[0],
+                *chunk.get(1).unwrap_or(&0),
+                *chunk.get(2).unwrap_or(&0),
+            ];
+            let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+            out.push(ALPHABET[(n >> 18) as usize & 63] as char);
+            out.push(ALPHABET[(n >> 12) as usize & 63] as char);
+            out.push(if chunk.len() > 1 {
+                ALPHABET[(n >> 6) as usize & 63] as char
+            } else {
+                '='
+            });
+            out.push(if chunk.len() > 2 {
+                ALPHABET[n as usize & 63] as char
+            } else {
+                '='
+            });
+        }
+        out
+    }
+
+    pub fn decode(text: &str) -> Option<Vec<u8>> {
+        let bytes = text.trim_end_matches('=').as_bytes();
+        let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
+        let value =
+            |c: u8| -> Option<u32> { ALPHABET.iter().position(|&a| a == c).map(|v| v as u32) };
+        for chunk in bytes.chunks(4) {
+            if chunk.len() < 2 {
+                return None;
+            }
+            let mut n = 0u32;
+            for (i, &c) in chunk.iter().enumerate() {
+                n |= value(c)? << (18 - 6 * i);
+            }
+            out.push((n >> 16) as u8);
+            if chunk.len() > 2 {
+                out.push((n >> 8) as u8);
+            }
+            if chunk.len() > 3 {
+                out.push(n as u8);
+            }
+        }
+        Some(out)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Round-trips at every length mod 3, and matches the RFC vectors.
+        #[test]
+        fn round_trips_and_matches_the_rfc() {
+            assert_eq!(encode(b""), "");
+            assert_eq!(encode(b"f"), "Zg==");
+            assert_eq!(encode(b"fo"), "Zm8=");
+            assert_eq!(encode(b"foo"), "Zm9v");
+            assert_eq!(encode(b"foobar"), "Zm9vYmFy");
+            for n in 0..32 {
+                let data: Vec<u8> = (0..n).map(|i| (i * 37 + 11) as u8).collect();
+                assert_eq!(decode(&encode(&data)).as_deref(), Some(data.as_slice()));
+            }
+            assert!(decode("!!!!").is_none(), "junk must not decode");
+        }
+    }
+}
+
 /// Answer to [`Call::HeadImuStream`]. Describes the head IMU rather than merely accepting, like
 /// [`TofStreamResult`]: a duck without the sensor still gets `accepted` with `sensor: None`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -6262,6 +6455,7 @@ mod tests {
                         call,
                         Call::Subscribe
                             | Call::RobotSubscribe(_)
+                            | Call::RobotMap
                             | Call::PadInput
                             | Call::TofStream
                             | Call::HeadImuStream
@@ -6277,7 +6471,7 @@ mod tests {
     fn every_call_covers_every_variant() {
         assert_eq!(
             every_call().len(),
-            78,
+            80,
             "a Call variant was added or removed — update every_call() and this count"
         );
     }

@@ -62,7 +62,7 @@ user did not exist, so its unit never started — a class `up` cannot see at all
 ```sh
 scripts/duck-sim                # a MuJoCo window opens, the duck stands up, and it is yours
 scripts/duck-sim status         # health, and whether it is standing
-scripts/duck-sim drive          # walk forward for 8 s (args: vx vyaw, default 0.15 0)
+scripts/duck-sim drive          # walk forward for 8 s (args: vx vyaw, default 0.3 0)
 scripts/duck-sim ctl health     # anything robotctl does, aimed at this duck
 scripts/duck-sim monitor        # robotctl monitor: joints, IMU, ToF, sticks
 scripts/duck-sim log            # robotd's log
@@ -80,6 +80,63 @@ sockets, which is the only thing that is different from a robot: on a board the 
 To talk to it from your own tools, the sockets are `~/.cache/duck-sim/duck-a.sock` (robotd; `duck.sock`
 is a link to whichever duck `ctl` talks to) and `~/.cache/duck-sim/duck-a-tof.sock`, and the body is
 on TCP port 7801.
+
+The policy set is the official one, kept under `~/.cache/duck-sim/policies` (a `policies/` directory
+in this repo wins over it). Every start runs `scripts/seed-policies.sh` on it, as a robot's update
+does, so a cache below the daemon's pin moves up to it — v8 to v9 — and one at the pin is left alone
+without touching the network. **The v9 velstand (v7's, byte for byte) stands still under small
+commands**: measured on `backlash`, 0.15 m/s and 0.6 rad/s move nothing, 0.2 m/s walks at about
+0.09 m/s, 0.3 m/s at 0.13 m/s, 0.8 rad/s turns at about 25 °/s. A navigator that asks for less than
+about 0.2 m/s or 0.8 rad/s gets a duck that stays put. v8 walked at 0.15 m/s; that is why `drive`
+now defaults to 0.3.
+
+## Mapping and localization
+
+```sh
+DUCK_SIM_MAPLOC=1 scripts/duck-sim   # or: scripts/duck-sim --maploc
+scripts/duck-sim mapcheck            # walk-and-stop route, estimates against the truth (args: vx vyaw, default 0.3 1.0)
+```
+
+Opt-in, off by default. It adds a `[maploc]` section to the duck's generated `robotd.toml` —
+`enabled = true`, `mode = "stop_and_scan"` (`DUCK_SIM_MAPLOC=continuous` picks the other mode), and
+a `map_path` of `~/.cache/duck-sim/<duck>-maploc-<scene>.session`, so a map of one world is never
+resumed in another. Delete that file for a fresh map. `tofd --sim` already serves the simulated
+head ToF; `robotd`'s maploc reads it at the socket named by `[theremin] socket`, which in the sim is
+the duck's own `duck-a-tof.sock` and on a robot `/run/tofd/tof.sock`.
+
+What a client then sees is what it will see on a robot: `robot.map` answers
+`{accepted, enabled, mode}` and pushes a `map.frame` about once a second — the pose in the map frame
+(`x`, `y`, `yaw`), `tracking` (whether the pose is vouched for), the occupancy grid and the window
+count — and `robot.state.odom` carries contact odometry, `{position: [x, y, z], yaw}`. In
+`stop_and_scan` the duck only inks the map while it stands still, and sweeps its head ±0.9 rad at
+every stop to widen its 45° view, so a navigator should stop for a few seconds now and then.
+
+`mapcheck` compares both against the simulator's true trunk pose, which no robot has, as
+displacements from where the route started. One run on `backlash` (bare floor, so nothing for the
+map to correct against): a 1.6 m route of two 5 s walks at 0.3 m/s and two 4 s turns at ±1 rad/s
+ended with odometry 13.5 cm off (8.4 % of the path) and 0.1° off in yaw, and the map pose 14 cm off;
+`tracking` came on at the first stop and stayed on, with 9 windows integrated. `apartment` gives the
+map walls to localize against, but carries the robot without backlash, so the duck does not walk in
+it yet.
+
+## Realism, obstacles and no assist
+
+```sh
+scripts/duck-sim --realism real --realism-seed 7      # the trained envelope; `hard` is past it
+scripts/duck-sim --no-assist                          # no simulation-only hand
+scripts/duck-sim --obstacles room.json --obstacle-slots 4
+scripts/duck-sim --maploc --realism real up           # options come before the command
+```
+
+Each option only exports the body server's variable before it starts — `DUCK_SIM_REALISM`
+(`off`, the default ideal twin), `DUCK_SIM_REALISM_SEED`, `DUCK_SIM_NO_ASSIST=1`,
+`DUCK_SIM_OBSTACLES` (made absolute; the file must exist) and `DUCK_SIM_OBSTACLE_SLOTS` — so setting
+them in the environment is the same thing. The body server (in `microduck_rl`) documents what each
+one does and the JSON format for user-supplied obstacle configurations.
+
+`down` never asks for a password: in the plain form there is nothing for `sudo` to stop, and with
+containers it uses `sudo -n` and says what it could not stop. It also stops a `mediad --sim-camera`
+that an earlier `up` started and that was relaunched by hand with the same configuration file.
 
 ## Several ducks, each a machine you log into
 
@@ -162,12 +219,14 @@ Environment variables, all optional:
 | `DUCK_SIM_STATE` | `~/.cache/duck-sim` | Sockets, logs, params, the rootfs and the ducks' overlays. Short on purpose: a unix socket path is capped at about 108 bytes. |
 | `DUCK_SIM_DUCKS` | `1` | How many ducks; `boot N` sets it too. |
 | `DUCK_SIM_SCENE` | bare floor | A scene name (`apartment`) or a path. |
+| `DUCK_SIM_PRELOAD_EQUIPMENT` | `0` | Set to `1` for one duck to compile both walking and roller models at startup, using more memory but avoiding recompilation during mode changes. |
 | `DUCK_SIM_CAMERAS` | none | Which ducks render a camera: `a`, `a,c`, `all`. |
 | `DUCK_SIM_DUCK` | `duck-a` | Which duck `ctl` and `monitor` talk to. |
 | `DUCK_SIM_KEYFRAME` | `SIT` | Where a duck starts: `SIT` folded on the floor (the standing policy rises from it), `HOME`, `STAND`, `FOLD`. |
 | `DUCK_SIM_VIEWER` | `1` | `0` runs MuJoCo headless. |
 | `DUCK_SIM_PORT` | `7801` | The first duck's body port; +1 per duck. |
 | `DUCK_SIM_FRAME_PORT` | `7901` | The first camera's frame port; +1 per camera. |
+| `DUCK_SIM_MAPLOC` | `0` | `1` (or `stop_and_scan`, or `--maploc` before the command) turns on mapping & localization; `continuous` picks the other mode. See above. |
 
 ## Things worth knowing
 

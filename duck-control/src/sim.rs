@@ -44,7 +44,7 @@ use crate::model::NUM_JOINTS;
 /// Checked in the handshake and reported by *both* numbers when it fails, because the two halves
 /// live in two repositories and "the simulator is too old" and "the daemon is too old" are the same
 /// symptom otherwise.
-pub const PROTOCOL: u32 = 1;
+pub const PROTOCOL: u32 = 2;
 
 /// How long to wait for the simulator to answer one request.
 ///
@@ -69,6 +69,8 @@ enum Request<'a> {
     Torque { on: bool },
     #[serde(rename = "slow")]
     Slow,
+    #[serde(rename = "mode")]
+    Mode { mode: &'a str, support: bool },
 }
 
 #[derive(Debug, Deserialize)]
@@ -125,6 +127,7 @@ pub struct RemoteIo {
     /// nothing is connected until the first read, so there is no earlier moment at which this
     /// could be known.
     load_reported: bool,
+    drive_mode: Option<(bool, bool)>,
 }
 
 struct Link {
@@ -141,6 +144,7 @@ impl RemoteIo {
             link: None,
             complained: false,
             load_reported: false,
+            drive_mode: None,
         }
     }
 
@@ -200,6 +204,7 @@ impl RemoteIo {
             tracing::info!(addr = %self.addr, protocol = PROTOCOL, "simulated body");
             self.complained = false;
             self.link = Some(link);
+            self.drive_mode = None;
         }
         Ok(self.link.as_mut().expect("just connected"))
     }
@@ -258,6 +263,7 @@ fn tag(request: &Request<'_>) -> &'static str {
         Request::Write { .. } => "write",
         Request::Gain { .. } => "gain",
         Request::Torque { .. } => "torque",
+        Request::Mode { .. } => "mode",
         Request::Slow => "slow",
     }
 }
@@ -270,6 +276,30 @@ fn acked(ack: Ack, what: &str) -> Result<()> {
 }
 
 impl RobotIo for RemoteIo {
+    fn set_drive_mode(&mut self, roller: bool, support: bool) -> Result<()> {
+        self.connect()?;
+        if self.drive_mode == Some((roller, support)) {
+            return Ok(());
+        }
+        // Compiling the newly equipped body costs more than a sensor tick.
+        self.connect()?
+            .write
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .map_err(|e| IoError::Bus(e.to_string()))?;
+        let result = self.call::<Ack>(&Request::Mode {
+            mode: if roller { "roller" } else { "walk" },
+            support,
+        });
+        if let Some(link) = self.link.as_ref() {
+            link.write
+                .set_read_timeout(Some(TIMEOUT))
+                .map_err(|e| IoError::Bus(e.to_string()))?;
+        }
+        acked(result?, "the drive mode")?;
+        self.drive_mode = Some((roller, support));
+        Ok(())
+    }
+
     fn read(&mut self) -> Result<Sensors> {
         let frame: SensorFrame = self.call(&Request::Read)?;
         self.load_reported = frame.currents_ma.is_some();
@@ -361,7 +391,7 @@ mod tests {
         (addr, handle)
     }
 
-    const HELLO: &str = r#"{"protocol":1}"#;
+    const HELLO: &str = r#"{"protocol":2}"#;
     // One line, because the protocol is one frame per line and a test fixture that wraps would be
     // testing the fixture.
     const SENSORS: &str = concat!(
@@ -371,6 +401,71 @@ mod tests {
         r#""imu":{"gyro":[0,0,0],"gravity":[0,0,-1],"quat":[1,0,0,0]}}"#
     );
     const OK: &str = r#"{}"#;
+
+    #[test]
+    fn equipment_tracks_mode_and_is_resent_after_reconnection() {
+        let (addr, sim) = simulator(vec![vec![HELLO, OK, OK], vec![HELLO, OK, SENSORS]]);
+        let mut io = RemoteIo::at(addr);
+        io.set_drive_mode(false, false).expect("walking equipment");
+        io.set_drive_mode(false, false).expect("idempotent");
+        io.set_drive_mode(true, false).expect("skates");
+        io.read().expect_err("the first simulator disconnected");
+        io.set_drive_mode(true, false)
+            .expect("skates after reconnect");
+        io.read().expect("sensors on the newly equipped body");
+        let heard = sim.join().expect("the simulator thread");
+        let modes: Vec<_> = heard
+            .iter()
+            .filter(|line| line.contains("\"op\":\"mode\""))
+            .collect();
+        assert_eq!(modes.len(), 3);
+        assert!(modes[0].contains("\"mode\":\"walk\""));
+        assert!(modes[1].contains("\"mode\":\"roller\""));
+        assert!(modes[2].contains("\"mode\":\"roller\""));
+    }
+
+    #[test]
+    fn support_changes_are_sent_even_when_the_equipment_does_not_change() {
+        let (addr, sim) = simulator(vec![vec![HELLO, OK, OK, OK]]);
+        let mut io = RemoteIo::at(addr);
+        io.set_drive_mode(false, false).expect("feet");
+        io.set_drive_mode(false, true)
+            .expect("steady for the home ramp");
+        io.set_drive_mode(false, true).expect("already supported");
+        io.set_drive_mode(true, false)
+            .expect("fit skates and release");
+        let heard = sim.join().expect("the simulator thread");
+        let modes: Vec<serde_json::Value> = heard
+            .iter()
+            .filter(|line| line.contains("\"op\":\"mode\""))
+            .map(|line| serde_json::from_str(line).expect("a mode request"))
+            .collect();
+        assert_eq!(modes.len(), 3);
+        assert_eq!(modes[0]["support"], false);
+        assert_eq!(modes[1]["mode"], "walk");
+        assert_eq!(modes[1]["support"], true);
+        assert_eq!(modes[2]["mode"], "roller");
+        assert_eq!(modes[2]["support"], false);
+    }
+
+    #[test]
+    fn equipment_refusal_is_not_cached_as_success() {
+        let (addr, sim) = simulator(vec![vec![HELLO, r#"{"error":"missing wheels"}"#, OK]]);
+        let mut io = RemoteIo::at(addr);
+        let error = io
+            .set_drive_mode(true, false)
+            .expect_err("equipment refused");
+        assert!(error.to_string().contains("missing wheels"));
+        io.set_drive_mode(true, false).expect("retry the same mode");
+        let heard = sim.join().expect("the simulator thread");
+        assert_eq!(
+            heard
+                .iter()
+                .filter(|line| line.contains("\"op\":\"mode\""))
+                .count(),
+            2
+        );
+    }
 
     #[test]
     fn a_read_carries_the_sensors_the_loop_expects() {
@@ -436,7 +531,7 @@ mod tests {
             .read()
             .expect_err("a mismatch is fatal to the connection");
         let said = error.to_string();
-        assert!(said.contains("99") && said.contains("1"), "{said}");
+        assert!(said.contains("99") && said.contains("2"), "{said}");
         assert!(said.contains("different repositories"), "{said}");
     }
 

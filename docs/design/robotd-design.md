@@ -542,6 +542,13 @@ scale, voltage-adaptive scaling, the standing-transition gain change. These are 
 policies are *trained* with, so they must match training or transfer degrades. The rule is not
 to regress what already runs.
 
+**The roller gait's unused command slots must stay zero.** Its training uses
+`zero_command_padding` for the four head and six body slots. Before building the
+walking-network observation in roller mode, the controller preserves twist but
+zeros those pose commands. Idle head animation and a lingering walking pose must
+not become out-of-distribution roller inputs. Sit/stand keeps its own encoding;
+walking mode remains head/body steerable.
+
 ### 2.4 Safety
 
 `safety` owns the only `RobotIo` write handle. No policy and no client has one, so nothing
@@ -962,6 +969,10 @@ daemon, override the corresponding file settings for bench use.
 
 `robotd` re-reads `[policy]` — all of it but `mode` and `enabled` — when asked to, which is how
 `robotctl policy add` lands a skill without taking motor control away from a standing robot.
+`[policy] directory` optionally selects a local policy set, including its manifest, instead of
+`/opt/robot/policies/current`. Mode defaults and built-in skills resolve there; explicit slot
+and skill paths still win. A simulator uses this instead of overriding `walk`, so a live mode
+switch can select the roller gait from the same set.
 Re-reading `[safety]` or `[control]` under a running loop is a different and much larger promise,
 and it is still not made. `robotctl configure` knows which of the three answers a key wants, and
 a key that says nothing fails a test in `robotctl`.
