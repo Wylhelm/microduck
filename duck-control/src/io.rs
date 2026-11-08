@@ -113,6 +113,13 @@ pub struct ImuStale {
 }
 
 pub trait RobotIo {
+    /// Synchronise simulated equipment with the policy bundle. Real hardware is equipped by
+    /// hand; its backend leaves this as a no-op. `support` steadies only a simulated
+    /// trunk during the mode-switch home ramp, never during ordinary locomotion.
+    fn set_drive_mode(&mut self, _roller: bool, _support: bool) -> Result<()> {
+        Ok(())
+    }
+
     /// One transaction: joints and IMU together.
     fn read(&mut self) -> Result<Sensors>;
     fn write(&mut self, targets: &JointTargets) -> Result<()>;

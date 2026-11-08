@@ -3,6 +3,12 @@
 #
 #   scripts/duck-sim              # a window opens, the duck stands up, and it is yours
 #   scripts/duck-sim drive        # walk it forward for a few seconds
+#   scripts/duck-sim --maploc     # the same, with mapping & localization on (DUCK_SIM_MAPLOC=1)
+#   scripts/duck-sim --realism real --no-assist --obstacles FILE.json
+#                                 # a less ideal twin: sensor/bus/body imperfections, no sim-only
+#                                 # hand, furniture placed at launch (DUCK_SIM_REALISM, _NO_ASSIST,
+#                                 # _OBSTACLES; also --realism-seed N, --obstacle-slots N)
+#   scripts/duck-sim mapcheck     # walk-and-stop route: odometry and map pose against the truth
 #   scripts/duck-sim ctl health   # anything robotctl does
 #   scripts/duck-sim down
 #
@@ -70,6 +76,12 @@ SCENE="${DUCK_SIM_SCENE:-backlash}"
 # 8080 + its index.
 CAMERAS="${DUCK_SIM_CAMERAS:-}"
 FRAME_PORT="${DUCK_SIM_FRAME_PORT:-7901}"
+
+# Mapping & localization (`[maploc]`), off by default as on a robot. `1` (or `--maploc` before the
+# command) turns it on in its default `stop_and_scan` mode; `continuous` picks that mode instead.
+# The map is fed by the duck's own simulated ToF through `tofd --sim`, and persists per scene in
+# the state directory, the way a robot keeps /var/lib/robot/maploc.session across reboots.
+MAPLOC="${DUCK_SIM_MAPLOC:-0}"
 SOCK="$STATE/duck.sock"
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 
@@ -166,6 +178,18 @@ stop_one() {
     kill -KILL "$pid" 2>/dev/null || sudo -n kill -KILL "$pid" 2>/dev/null || true
 }
 
+# A daemon relaunched by hand (a link-loss test restarting mediad, say) has a pid this script never
+# wrote down. Ours by the same test as `stop_one`: our user, that program, and a command line naming
+# this state directory's own file — which no other checkout's duck can carry.
+stop_strays() {
+    for pid in $(pgrep -u "$(id -u)" -x "$1" 2>/dev/null || true); do
+        cmdline_of "$pid" | grep -qF -- "$2" || continue
+        say "stopping $1 pid $pid: relaunched outside its pidfile"
+        echo "$pid" > "$STATE/stray.pid"
+        stop_one stray "$2"
+    done
+}
+
 down() {
     stop_one robotd "$STATE/"
     stop_one ether "$STATE/"
@@ -175,6 +199,7 @@ down() {
         stop_one "$(duck_name "$i")" "$STATE/$(duck_name "$i").sock"
         stop_one "$(duck_name "$i")-tof" "$STATE/$(duck_name "$i")-tof.sock"
         stop_one "$(duck_name "$i")-media" "$STATE/mediad-$(duck_name "$i").toml"
+        stop_strays mediad "$STATE/mediad-$(duck_name "$i").toml"
         stop_one "$(duck_name "$i")-config" "$STATE/$(duck_name "$i")-config.sock"
         stop_one "$(duck_name "$i")-updater" "$STATE/$(duck_name "$i")-updater.sock"
         i=$((i + 1))
@@ -220,12 +245,34 @@ policies() {
         return 0
     fi
     POLICIES="$STATE/policies/current"
-    [ -f "$POLICIES/velstand.onnx" ] || {
-        say "no policy set here — fetching the official one"
-        sh "$REPO/scripts/seed-policies.sh" "$STATE/policies" || true
-    }
+    # Every start, not only when nothing is there: a robot runs this on every update, and it is
+    # what moves a set below the daemon's pin up to it (v8 -> v9). It touches nothing when the
+    # set is at or past the pin, or not ours, and needs no network then.
+    [ -f "$POLICIES/velstand.onnx" ] || say "no policy set here — fetching the official one"
+    sh "$REPO/scripts/seed-policies.sh" "$STATE/policies" || true
     [ -f "$POLICIES/velstand.onnx" ] ||
         die "no velstand.onnx in $STATE/policies. It needs the network once, or your own set (v5 or later) in $REPO/policies."
+}
+
+# The `[maploc]` section, or nothing. `DUCK` in the map path becomes each duck's name, like the
+# sound bank; the scene is in it too, because a map of one world is a wrong map of another.
+maploc_section() {
+    case "$MAPLOC" in
+        0 | "") return 0 ;;
+        1 | stop_and_scan) mode=stop_and_scan ;;
+        continuous) mode=continuous ;;
+        *) die "DUCK_SIM_MAPLOC must be 0, 1, stop_and_scan or continuous" ;;
+    esac
+    scene_tag="$(printf %s "$(basename "$SCENE" .xml)" | tr -c 'A-Za-z0-9_-' '_')"
+    cat <<TOML
+
+# DUCK_SIM_MAPLOC: mapping & localization from the simulated ToF, fed by this duck's tofd --sim
+# over the depth socket named in [theremin].
+[maploc]
+enabled = true
+mode = "$mode"
+map_path = "$STATE/DUCK-maploc-$scene_tag.session"
+TOML
 }
 
 up() {
@@ -243,21 +290,11 @@ up() {
     build_daemons
     policies
 
-    # Every policy named explicitly: `RELEASE_DIR` is /opt/robot/daemon/current, which exists on a
-    # robot and not here, and `PolicyParams::resolved` uses a named path verbatim when it has one.
+    # Name the local set, not the walk slot: a walk override also wins in roller mode.
     cat > "$STATE/robotd.toml" <<TOML
 [policy]
 enabled = true
-# A robot's own defaults (deploy/robotd.toml): velstand walks and stands, and there is no separate
-# standing network. alpha_walking with alpha_stand is the pre-v5 pair, and it does not walk in
-# MuJoCo at all — commanded 0.15 m/s, it stands, in this simulator's own inference script too.
-walk = "$POLICIES/velstand.onnx"
-stand = "none"
-sitstand = "$POLICIES/alpha_sitstand.onnx"
-ground_pick = "$POLICIES/alpha_ground_pick.onnx"
-kick_left = "$POLICIES/ball_kick_left.onnx"
-kick_right = "$POLICIES/ball_kick_right.onnx"
-roulade = "$POLICIES/roulade.onnx"
+directory = "$POLICIES"
 
 # Singing is opt-in, and a room full of ducks that will not sing together is a poor demonstration
 # of a room full of ducks. On a real robot this is a decision someone makes; here it is the point.
@@ -283,6 +320,7 @@ dir = "$REPO/robotd/emotions"
 [theremin]
 socket = "$STATE/DUCK-tof.sock"
 TOML
+    maploc_section >> "$STATE/robotd.toml"
 
     # **A voice each, and it is not decoration.** `robotctl chorale` refuses without one — but more
     # than that, `robotd` takes its chorale id from the seed recorded in the bank it plays from, and
@@ -294,6 +332,7 @@ TOML
     while [ "$i" -lt "$DUCKS" ]; do
         name="$(duck_name "$i")"
         sed -e "s|/sounds/DUCK|/sounds/$name|" -e "s|/DUCK-tof.sock|/$name-tof.sock|" \
+            -e "s|/DUCK-maploc-|/$name-maploc-|" \
             "$STATE/robotd.toml" > "$STATE/robotd-$name.toml"
         if [ ! -d "$STATE/sounds/$name" ]; then
             say "rendering $name a voice"
@@ -643,6 +682,9 @@ start_body() {
     [ -x "$RL/.venv/bin/python" ] || die "$RL has no .venv. Run \`uv sync\` there first."
     mkdir -p "$STATE"
     say "starting the body from $RL — a MuJoCo window should open"
+    [ "${DUCK_SIM_REALISM:-off}" = off ] || say "realism: $DUCK_SIM_REALISM (seed ${DUCK_SIM_REALISM_SEED:-0})"
+    [ -z "${DUCK_SIM_NO_ASSIST:-}" ] || say "no simulation-only assist: equipment is fitted by equipment.fit"
+    [ -z "${DUCK_SIM_OBSTACLES:-}" ] || say "obstacles: $DUCK_SIM_OBSTACLES"
     # `DUCK_SIM_VIEWER=0` for a window-less run: watching costs frames, and the daemon's loop is
     # wall-clock, so a simulator that cannot keep up is a robot that cannot balance.
     [ "${DUCK_SIM_VIEWER:-1}" = 0 ] && HEADLESS=--headless || HEADLESS=
@@ -659,10 +701,19 @@ start_body() {
     # the *subshell's* pid, because `A && B & C` parses as `(A && B) & C` — so `down` killed a
     # wrapper and left MuJoCo running as an orphan. `setsid` puts the simulator in its own process
     # group, which is what makes stopping it one signal rather than a hunt.
+    set -- --port "$PORT" --ducks "$DUCKS" --keyframe "${DUCK_SIM_KEYFRAME:-SIT}"
+    if [ -n "$HEADLESS" ]; then
+        set -- "$@" "$HEADLESS"
+    fi
     case "$SCENE" in
-        "")   scene_arg="" ;;
-        */*)  scene_arg="--scene $SCENE" ;;
-        *)    scene_arg="--scene $RL/src/mjlab_microduck/robot/microduck/scene_$SCENE.xml" ;;
+        "")   ;;
+        */*)  set -- "$@" --scene "$SCENE" ;;
+        *)    set -- "$@" --scene "$RL/src/mjlab_microduck/robot/microduck/scene_$SCENE.xml" ;;
+    esac
+    case "${DUCK_SIM_PRELOAD_EQUIPMENT:-0}" in
+        0) ;;
+        1) set -- "$@" --preload-equipment ;;
+        *) die "DUCK_SIM_PRELOAD_EQUIPMENT must be 0 or 1" ;;
     esac
     # **The camera flags go with the cameras.** Rendering is newer than the body server, and a
     # build without it has no `--cameras`/`--frame-port` — argparse then refuses the whole
@@ -677,14 +728,17 @@ start_body() {
     # line that would mean something if the simulator really were falling behind. 30 costs about a
     # third of a core per camera, which is the trade `DUCK_SIM_CAMERAS` already exists to let you
     # decline.
-    cam_args=""
     if [ -n "$CAMERAS" ]; then
-        cam_args="--cameras $CAMERAS --frame-port $FRAME_PORT --camera-fps 30"
+        set -- "$@" --cameras "$CAMERAS" --frame-port "$FRAME_PORT" --camera-fps 30
+    fi
+    # WSL2: without these, Mesa falls back to llvmpipe (software GL) and the viewer crawls.
+    # Respect any value the caller already set.
+    if [ -e /dev/dxg ]; then
+        export GALLIUM_DRIVER="${GALLIUM_DRIVER:-d3d12}"
+        export MESA_D3D12_DEFAULT_ADAPTER_NAME="${MESA_D3D12_DEFAULT_ADAPTER_NAME:-NVIDIA}"
     fi
     # shellcheck disable=SC2086
-    $SETSID nohup "$PY_BIN" -m mjlab_microduck.sim.body_server \
-        --port "$PORT" --ducks "$DUCKS" --keyframe "${DUCK_SIM_KEYFRAME:-SIT}" $HEADLESS $scene_arg \
-        $cam_args \
+    $SETSID nohup "$PY_BIN" -m mjlab_microduck.sim.body_server "$@" \
         > "$STATE/body.log" 2>&1 &
     echo $! > "$STATE/body.pid"
     if ! wait_for_port; then
@@ -711,7 +765,9 @@ WHY
 
 wait_for_port() {
     i=0
-    while [ $i -lt 100 ]; do
+    # Two precompiled equipment models can take longer for detailed scanned scenes.
+    [ "${DUCK_SIM_PRELOAD_EQUIPMENT:-0}" = 1 ] && limit=300 || limit=100
+    while [ $i -lt "$limit" ]; do
         # Not /dev/tcp: that is a bash builtin and this is #!/bin/sh, which is dash on Debian
         # and Ubuntu. python3 is already required by `drive`, so it is the portable knock.
         if python3 -c "import socket,sys;s=socket.socket();s.settimeout(.3);sys.exit(s.connect_ex(('127.0.0.1',$PORT)))" 2>/dev/null; then
@@ -741,8 +797,10 @@ wait_for_socket() {
 # had sent the intents, and "still upright after walking" was a duck that had never taken a step.
 drive() {
     [ -S "$SOCK" ] || die "no duck. \`scripts/duck-sim\` first."
-    say "walking for 8 s at vx ${1:-0.15} m/s, vyaw ${2:-0.0} rad/s"
-    python3 - "$SOCK" "$PORT" "${1:-0.15}" "${2:-0.0}" <<'PY'
+    # 0.3 rather than 0.15: the v9 velstand (v7's) stands still under about 0.2 m/s and
+    # 0.8 rad/s — measured in this sim, see docs/robot/simulation.md.
+    say "walking for 8 s at vx ${1:-0.3} m/s, vyaw ${2:-0.0} rad/s"
+    python3 - "$SOCK" "$PORT" "${1:-0.3}" "${2:-0.0}" <<'PY'
 import json, math, socket, sys, time
 sock, port, vx, vyaw = sys.argv[1], int(sys.argv[2]), float(sys.argv[3]), float(sys.argv[4])
 body = socket.create_connection(("127.0.0.1", port)).makefile("rw")
@@ -771,6 +829,84 @@ if abs(vx) >= 0.05 and moved < 0.25 * abs(vx) * 8:
           "docs/design/simulation.md, \"Ways to pick the wrong model\".")
 PY
     say "stopped — the intent expires on its own"
+}
+
+# Contact odometry and the maploc pose against the simulator's ground truth, over a short
+# walk-and-stop route. The truth is the body server's trunk pose, which a robot does not have —
+# this is how far the duck's own estimates are from it. Both estimates are compared as
+# displacements from where the route started, each in its own starting frame, so neither needs
+# to share an origin with the world.
+mapcheck() {
+    [ -S "$SOCK" ] || die "no duck. \`scripts/duck-sim\` first."
+    say "walk-and-stop route (~50 s): odometry and map pose against the simulator's truth"
+    python3 - "$SOCK" "$PORT" "${1:-0.3}" "${2:-1.0}" <<'PY'
+import json, math, socket, sys, threading, time
+sock, port, vx, wz = sys.argv[1], int(sys.argv[2]), float(sys.argv[3]), float(sys.argv[4])
+body = socket.create_connection(("127.0.0.1", port)).makefile("rw")
+body.write(json.dumps({"op": "hello", "protocol": 1, "joints": 15}) + "\n"); body.flush(); body.readline()
+def truth():
+    body.write('{"op":"read"}\n'); body.flush(); r = json.loads(body.readline())
+    w, x, y, z = r["imu"]["quat"]
+    return r["trunk"][0], r["trunk"][1], math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+latest = {"odom": None, "map": None, "maps": 0, "info": None, "policy": None}
+def subscribe(method, params):
+    s = socket.socket(socket.AF_UNIX); s.connect(sock); f = s.makefile("rw")
+    f.write(json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}) + "\n"); f.flush()
+    for line in f:
+        m = json.loads(line)
+        if m.get("id") == 1:
+            latest["info" if method == "robot.map" else "sub"] = m.get("result", m.get("error"))
+        elif m.get("method") == "robot.state":
+            latest["policy"] = m["params"].get("policy")
+            o = m["params"].get("odom") or {}
+            if "position" in o:
+                latest["odom"] = (o["position"][0], o["position"][1], o["yaw"])
+        elif m.get("method") == "map.frame":
+            p = m["params"]; latest["maps"] += 1
+            latest["map"] = (p["x"], p["y"], p["yaw"], p["tracking"], p["windows"], p["n_submaps"], p["seq"])
+threading.Thread(target=subscribe, args=("robot.subscribe", {"hz": 10}), daemon=True).start()
+threading.Thread(target=subscribe, args=("robot.map", {}), daemon=True).start()
+ctl = socket.socket(socket.AF_UNIX); ctl.connect(sock); cf = ctl.makefile("w")
+def rel(p, p0):
+    dx, dy = p[0] - p0[0], p[1] - p0[1]; c, s = math.cos(-p0[2]), math.sin(-p0[2])
+    return c * dx - s * dy, s * dx + c * dy, math.atan2(math.sin(p[2] - p0[2]), math.cos(p[2] - p0[2]))
+time.sleep(2.0)
+print("   robot.map answered:", latest["info"])
+t0, o0, m0 = truth(), latest["odom"], latest["map"]
+if o0 is None:
+    sys.exit("   no robot.state odom arrived")
+route = [(0, 0, 6), (vx, 0, 5), (0, 0, 6), (0, wz, 4), (0, 0, 6), (vx, 0, 5), (0, 0, 6), (0, -wz, 4), (0, 0, 6)]
+path, last_t, start = 0.0, t0, time.time()
+print("     t  | truth dx   dy   dyaw | odom err cm  yaw deg | map err cm  yaw deg trk win sub seq policy")
+def row():
+    t = truth(); tr = rel(t, t0); od = rel(latest["odom"], o0)
+    e_o = math.hypot(od[0] - tr[0], od[1] - tr[1]) * 100
+    y_o = math.degrees(math.atan2(math.sin(od[2] - tr[2]), math.cos(od[2] - tr[2])))
+    out = f"  {time.time() - start:5.1f} | {tr[0]:+.2f} {tr[1]:+.2f} {math.degrees(tr[2]):+5.0f} | {e_o:7.1f} {y_o:+7.1f}"
+    m = latest["map"]
+    if m and m0:
+        mp = rel(m[:3], m0[:3])
+        e_m = math.hypot(mp[0] - tr[0], mp[1] - tr[1]) * 100
+        y_m = math.degrees(math.atan2(math.sin(mp[2] - tr[2]), math.cos(mp[2] - tr[2])))
+        out += f" | {e_m:7.1f} {y_m:+7.1f} {int(m[3])} {m[4]:3d} {m[5]:3d} {m[6]} {latest['policy']}"
+    elif m:
+        out += f" | (first map frame came late) trk={int(m[3])} seq={m[6]}"
+    else:
+        out += " | no map frame"
+    print(out, flush=True)
+    return t, e_o, y_o
+for v, w, secs in route:
+    for i in range(int(secs * 10)):
+        if v or w:
+            cf.write(json.dumps({"jsonrpc": "2.0", "method": "robot.move",
+                                 "params": {"vx": v, "vy": 0.0, "vyaw": w}}) + "\n"); cf.flush()
+        time.sleep(0.1)
+        if i % 10 == 9:
+            t, e_o, y_o = row()
+            path += math.dist(t[:2], last_t[:2]); last_t = t
+print(f"   path {path:.2f} m: final odometry error {e_o:.1f} cm ({e_o / max(path * 100, 1e-6) * 100:.1f}% of path), "
+      f"yaw {y_o:+.1f} deg; map frames received {latest['maps']}")
+PY
 }
 
 # How fast the world is actually running. The daemons' loops are wall-clock, so a simulator below
@@ -810,16 +946,23 @@ down_containers() {
     # would never run — ducks left booted, overlays left mounted, which is the one outcome this
     # function exists to prevent. `shellcheck` does not report a `|| true` that was dropped, so
     # nothing in CI catches the removal.
+    #
+    # **And it never asks for a password.** The plain form runs headless from scripts and agents
+    # with no terminal, where a `sudo` prompt is a `down` that hangs until it is killed — and the
+    # duck it was meant to stop keeps running. `is-active` needs no privilege, so a machine with no
+    # duck booted calls `sudo` not at all; one that has one uses `sudo -n` and says so if it cannot.
     command -v systemctl >/dev/null 2>&1 || return 0
     i=0
     while [ "$i" -lt 16 ]; do
         name="$(duck_name "$i")"
-        if sudo systemctl is-active --quiet "$name" 2>/dev/null; then
-            sudo systemctl stop "$name" 2>/dev/null || true
+        if systemctl is-active --quiet "$name" 2>/dev/null; then
+            sudo -n systemctl stop "$name" 2>/dev/null ||
+                say "$name is booted and needs sudo to stop: sudo systemctl stop $name"
         fi
         merged="$STATE/ducks/$name/merged"
         if mountpoint -q "$merged" 2>/dev/null; then
-            sudo umount "$merged" 2>/dev/null || true
+            sudo -n umount "$merged" 2>/dev/null ||
+                say "$merged is still mounted and needs sudo: sudo umount $merged"
         fi
         i=$((i + 1))
     done
@@ -920,6 +1063,9 @@ stage() {
         mkdir -p "$REL/bin" "$REL/policies" "$ROOTFS/etc/systemd/system/robotd.service.d"
         install -m755 "$REPO/target/debug/robotd" "$REPO/target/debug/robotctl" "$REL/bin/"
         cp "$REPO"/policies/*.onnx "$REL/policies/"
+        # robotd reads its set from /opt/robot/policies/current, outside the release, as on a board
+        mkdir -p "$ROOTFS/opt/robot/policies/current"
+        cp "$REPO"/policies/*.onnx "$REPO"/policies/manifest.json "$ROOTFS/opt/robot/policies/current/" 2>/dev/null || cp "$REPO"/policies/*.onnx "$ROOTFS/opt/robot/policies/current/"
         ln -sfn /opt/robot/daemon/releases/sim "$ROOTFS/opt/robot/daemon/current"
         # On PATH, because the first thing anybody types after logging into a duck is `robotctl`
         # and `command not found` is a poor greeting. A symlink rather than a profile.d line: it
@@ -1058,8 +1204,8 @@ CONF
         fi
         say "booting $name (body on port $(duck_port "$i"))"
         # An empty AUDIO_BIND must pass no argument at all, so the word split is the point — the
-        # same shape as the four other deliberately unquoted lists here: `$mediad_features`, two
-        # calls' `$args`, and the body server's `$HEADLESS $scene_arg $cam_args`.
+        # same shape as the other deliberately unquoted lists here: `$mediad_features` and two
+        # calls' `$args`.
         # shellcheck disable=SC2086
         sudo systemd-run --collect --unit="$name" --quiet \
             systemd-nspawn -D "$upper/merged" --machine="$name" --boot \
@@ -1140,6 +1286,26 @@ shell() {
     sudo machinectl shell "${1:-$(duck_name 0)}"
 }
 
+# Options before the command. Each is the environment variable beside it, exported here so the
+# body server (`microduck_rl`'s sim/body_server.py reads them) and `down`/`ctl` see one setting.
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --maploc) MAPLOC="${MAPLOC#0}"; MAPLOC="${MAPLOC:-1}"; shift ;;
+        --realism) [ $# -ge 2 ] || die "--realism needs off, real or hard"
+            export DUCK_SIM_REALISM="$2"; shift 2 ;;
+        --realism-seed) [ $# -ge 2 ] || die "--realism-seed needs a number"
+            export DUCK_SIM_REALISM_SEED="$2"; shift 2 ;;
+        --no-assist) export DUCK_SIM_NO_ASSIST=1; shift ;;
+        --obstacles) [ $# -ge 2 ] || die "--obstacles needs a JSON file"
+            [ -f "$2" ] || die "no obstacles file at $2"
+            DUCK_SIM_OBSTACLES="$(cd "$(dirname "$2")" && pwd)/$(basename "$2")"
+            export DUCK_SIM_OBSTACLES; shift 2 ;;
+        --obstacle-slots) [ $# -ge 2 ] || die "--obstacle-slots needs a number"
+            export DUCK_SIM_OBSTACLE_SLOTS="$2"; shift 2 ;;
+        *) break ;;
+    esac
+done
+
 case "${1:-up}" in
     up|"")   up ;;
     rootfs)  rootfs ;;
@@ -1147,6 +1313,7 @@ case "${1:-up}" in
     shell)   shift; shell "$@" ;;
     down)    down_containers; down ;;
     drive)   shift; drive "$@" ;;
+    mapcheck) shift; mapcheck "$@" ;;
     ctl)     shift; ctl "$@" ;;
     stand)   stand && sleep 6 && upright ;;
     status)  ctl health | head -4; upright ;;
@@ -1154,5 +1321,5 @@ case "${1:-up}" in
     log)     tail -f "$STATE/robotd.log" ;;
     simlog)  tail -f "$STATE/body.log" ;;
     realtime) realtime ;;
-    *)       die "unknown command '$1'. Try: up, boot, shell, down, stand, drive, monitor, ctl, log, simlog, status, realtime" ;;
+    *)       die "unknown command '$1'. Try: up, boot, shell, down, stand, drive, mapcheck, monitor, ctl, log, simlog, status, realtime" ;;
 esac

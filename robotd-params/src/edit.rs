@@ -1981,6 +1981,7 @@ mod tests {
                 "pickup",
                 "theremin",
                 "head_imu",
+                "maploc",
                 "audio",
                 "emotions",
                 "media",

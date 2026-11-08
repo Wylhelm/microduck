@@ -172,6 +172,11 @@ pub const REGISTRY: &[Entry] = &[
          is the mode a reboot comes back in",
     ),
     entry(
+        "policy.directory",
+        Kind::OptionalPath,
+        "Policy set directory; unset = the board's installed set. Keeps live mode selection",
+    ),
+    entry(
         "policy.skill",
         Kind::Table,
         "One-shot skills, in priority order — add and remove with `robotctl policy`",
@@ -579,6 +584,37 @@ pub const REGISTRY: &[Entry] = &[
         "head_imu.enabled",
         Kind::Bool,
         "Read the head IMU at all — default off on zero3 (BMI088, ~4% of a core), on on beta (LSM6DSV16X, fused on the chip)",
+    ),
+    // ── [maploc] ─────────────────────────────────────────────────────────────
+    feature(
+        "maploc.enabled",
+        Kind::Bool,
+        "Mapping & localization from the head ToF — the most CPU-hungry thing the robot can do",
+    ),
+    entry(
+        "maploc.mode",
+        Kind::Choice(&["stop_and_scan", "continuous"]),
+        "stop_and_scan inks only vetted still windows; continuous also paints while walking",
+    ),
+    entry(
+        "maploc.map_path",
+        Kind::Text,
+        "Where the mapping session persists across restarts",
+    ),
+    entry(
+        "maploc.wipe_on_boot",
+        Kind::Bool,
+        "Start every boot from a clean map instead of resuming the saved session",
+    ),
+    entry(
+        "maploc.search_sweep",
+        Kind::Bool,
+        "Sweep the head at stops so scans cover ~150° instead of one 45° wedge",
+    ),
+    entry(
+        "maploc.record_dir",
+        Kind::Text,
+        "Record everything the mapper consumes to .mdlg logs here; unset = no recording",
     ),
     // ── [audio] ──────────────────────────────────────────────────────────────
     feature(
@@ -1342,6 +1378,7 @@ mod tests {
                 "pickup.enabled",
                 "theremin.enabled",
                 "head_imu.enabled",
+                "maploc.enabled",
                 "audio.enabled",
                 "audio.greet",
                 "audio.pet_detect",
